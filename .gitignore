@@ -1,0 +1,33 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.idea/
+.vscode/
+
+# Ignore large model checkpoints or logs
+*.pth
+*.pt
+*.cpkt
+*.bin
+*.safetensors
+*.log
+runs/
+wandb/
+
+# If data folder is too large and shouldn't be tracked, uncomment below
+# data/
+results/
+_archive/
+data/
+results/
+*.pkl
+*.npy
+*.csv
