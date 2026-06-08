@@ -8,8 +8,12 @@ Implement the **pFairFT** method: targeted LoRA injection on identified discrimi
 ## Training Pipeline
 1. Load fairness anchors from Component Identification results (`results.pkl`)
 2. Inject LoRA adapters **only** on selected sensitive heads
-3. Train with fairness loss: L = λ × L_f (project activations to neutral anchor)
-4. Monitor KL divergence between fact/counterfactual outputs
+3. Train selected comparison branches:
+   - Global LoRA CE: CE on fact/counterfactual resume pairs across all LoRA target modules.
+   - PFairFT: precise selected heads with affine fairness and CE (`fairness_ce`).
+   - PFairFT-KL: precise selected heads with affine fairness and KL (`fairness_kl`).
+   - PFairFT-KL-CE: precise selected heads with affine fairness, KL, and CE (`fairness_kl_ce`).
+4. Monitor branch-specific loss metrics and downstream fairness/utility evaluation.
 
 ## Scripts
 
@@ -23,7 +27,16 @@ Implement the **pFairFT** method: targeted LoRA injection on identified discrimi
 | `visualize_finetune_results.py` | exp5 | Plot training curves |
 
 ## Usage
+
+Use the repository-level standard driver for MOE resume-transfer runs:
+
 ```bash
-bash scripts/run_exp4_finetune.sh   # Precision fine-tuning
-bash scripts/run_exp5_finetune.sh   # Global LoRA baseline
+MODEL_NAME=OLMoE-1B-7B-0924-Instruct \
+MODEL_PATH=/mnt/nfs/models/OLMoE-1B-7B-0924-Instruct \
+MODEL_TYPE=olmoe \
+DRY_RUN=0 RUN_TRAIN=1 RUN_RANKING=0 RUN_HEADS=0 RUN_RESUME_EVAL=0 RUN_DISCRIM_EVAL=0 RUN_MMLU=0 RUN_PLOTS=0 \
+bash scripts/run_moe_resume_standard.sh
 ```
+
+The old `run_exp*` finetuning wrappers were removed because they encoded stale
+sample sizes, prompt modes, or branch names.

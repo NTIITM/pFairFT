@@ -18,7 +18,17 @@ Evaluate fine-tuned models on both **fairness benchmarks** (Discrim-Eval, Resume
 | `compute_exp26_metrics.py` | exp26 | Compute comprehensive metrics |
 
 ## Usage
+
+Use the repository-level standard driver for MOE downstream evaluation:
+
 ```bash
-bash scripts/run_exp14.sh  # MMLU evaluation
-bash scripts/run_exp16.sh  # Discrim-Eval comparison
+MODEL_NAME=JetMoE-8B-Chat \
+MODEL_PATH=/mnt/nfs/models/JetMoE-8B-Chat \
+MODEL_TYPE=jetmoe \
+DRY_RUN=0 RUN_ALL=0 RUN_RESUME_EVAL=1 RUN_DISCRIM_EVAL=1 RUN_MMLU=1 RUN_PLOTS=1 \
+bash scripts/run_moe_resume_standard.sh
 ```
+
+`evaluate_models_discrim.py` appends to its CSV output, so fresh standard runs should
+remove or rename the target CSV first. The standard driver removes fresh output paths
+before writing them.
