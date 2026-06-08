@@ -90,7 +90,7 @@ def main():
     parser.add_argument("--pfairft_csv", type=str, required=True)
     parser.add_argument("--pfairft_kl_csv", type=str, required=True)
     parser.add_argument("--global_csv", type=str, required=True)
-    parser.add_argument("--pfairft_ce_csv", type=str, default=None)
+    parser.add_argument("--pfairft_kl_ce_csv", type=str, default=None)
     parser.add_argument("--out_pdf", type=str, required=True)
     parser.add_argument("--model_label", type=str, default="Llama 3B", help="Model label for X-axis")
     args = parser.parse_args()
@@ -101,7 +101,7 @@ def main():
     stats_p = _load_intervention_stats(args.pfairft_csv) if os.path.exists(args.pfairft_csv) else None
     stats_pkl = _load_intervention_stats(args.pfairft_kl_csv) if os.path.exists(args.pfairft_kl_csv) else None
     stats_g = _load_intervention_stats(args.global_csv) if os.path.exists(args.global_csv) else None
-    stats_pklce = _load_intervention_stats(args.pfairft_ce_csv) if args.pfairft_ce_csv and os.path.exists(args.pfairft_ce_csv) else None
+    stats_pklce = _load_intervention_stats(args.pfairft_kl_ce_csv) if args.pfairft_kl_ce_csv and os.path.exists(args.pfairft_kl_ce_csv) else None
 
     # We sort by baseline's fairness violation descending
     ordered_qids = sorted(
@@ -137,7 +137,7 @@ def main():
 
     if stats_pklce is not None:
         means_pklce, _ = extract(stats_pklce)
-        ax.plot(xs, means_pklce, label="PFairFT-CE", color="black", linewidth=2.0)
+        ax.plot(xs, means_pklce, label="PFairFT-KL-CE", color="black", linewidth=2.0)
 
     ax.set_ylabel("Fairness Violation↓", fontweight="bold")
     ax.set_xlabel(f"{args.model_label} Samples", fontweight="bold")

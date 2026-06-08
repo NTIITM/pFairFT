@@ -3,14 +3,16 @@
 """EXP23: Head-level fairness violation comparison on QID.
 
 We compute per-head metric: mean |Δp_yes| between factual/counterfactual paired samples.
-Compare exp4 vs exp5 adapters on base model Meta-Llama-3-8B-Instruct.
+Compare two adapters on a base model. Dense models use o_proj-input head
+activations; MOE models use the activation surface defined by src/model_adapter.py.
 
 Outputs under output_dir:
-- exp4_md.npy
-- exp5_md.npy
+- first_md.npy
+- second_md.npy
 """
 
 import argparse
+import json
 import os
 
 os.environ["TRANSFORMERS_NO_SKLEARN"] = "1"
@@ -30,30 +32,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 
 from prompt import add_yes_no_instruction, format_prompt_for_model, resolve_model_type
 from probability import NO_CANDIDATES, YES_CANDIDATES, get_target_token_ids
-from util import get_model_config
-from hook import get_activation_hook_for_intervention, get_last_token_indices_safe
+from hook import get_last_token_indices_safe
+from model_adapter import get_model_adapter
 from sampling import load_discrim_eval_pairs
-
-
-def _get_hf_layers_container(model):
-    """Return the module that owns `layers` for llama/qwen style models.
-
-    Works for both raw HF model and PEFT-wrapped model.
-    """
-    m = model
-    # For PeftModel, base_model.model is the LlamaForCausalLM
-    if hasattr(m, "base_model") and hasattr(m.base_model, "model"):
-        m = m.base_model.model
-    
-    # Common: LlamaForCausalLM -> .model (LlamaModel) -> .layers
-    if hasattr(m, "model") and hasattr(m.model, "layers"):
-        return m.model
-
-    # Some wrappers may already expose .layers
-    if hasattr(m, "layers"):
-        return m
-
-    raise AttributeError("Cannot locate layers container (expected .model.layers)")
 
 
 class PairedQidDataset(Dataset):
@@ -78,21 +59,19 @@ def collect_acts(
     tokenizer,
     dataloader,
     model_type,
+    adapter,
     device,
     num_layers,
     num_heads,
     head_dim,
 ):
-    layers_owner = _get_hf_layers_container(model)
-
     batch_activations_buffer: Dict[int, torch.Tensor] = {}
     hooks = []
     for l in range(num_layers):
-        layer_module = layers_owner.layers[l].self_attn.o_proj
-        hook_fn = get_activation_hook_for_intervention(
+        hook_fn = adapter.register_head_activation_hook(
             l, num_heads, head_dim, batch_activations_buffer
         )
-        hooks.append(layer_module.register_forward_hook(hook_fn))
+        hooks.append(hook_fn)
 
     def _collect(is_fact: bool):
         all_acts: Dict[Tuple[int, int], List[np.ndarray]] = {}
@@ -146,61 +125,52 @@ def collect_acts(
     return fact_acts, cf_acts
 
 
-def compute_md(model, tokenizer, fact_acts, cf_acts, num_layers, num_heads, head_dim):
-    layers_owner = _get_hf_layers_container(model)
-
+def compute_md(adapter, tokenizer, fact_acts, cf_acts, num_layers, num_heads, head_dim):
     yes_ids = get_target_token_ids(tokenizer, YES_CANDIDATES)
     no_ids = get_target_token_ids(tokenizer, NO_CANDIDATES)
     cand_ids_list = list(dict.fromkeys(yes_ids + no_ids))
     if not cand_ids_list:
         raise ValueError("Could not resolve YES/NO candidate token IDs")
 
-    # Access lm_head: model might be PeftModel
-    m_for_head = model
-    if hasattr(m_for_head, "base_model") and hasattr(m_for_head.base_model, "model"):
-        m_for_head = m_for_head.base_model.model
-    w_u = m_for_head.lm_head.weight
-
     mean_diff_p_yes = np.zeros((num_layers, num_heads), dtype=np.float64)
     yes_set = set(yes_ids)
+    cand_ids = torch.tensor(cand_ids_list, dtype=torch.long)
+    yes_mask = torch.tensor(
+        [tid in yes_set for tid in cand_ids_list],
+        dtype=torch.bool,
+    )
 
     for l in range(num_layers):
-        o_proj_weight = layers_owner.layers[l].self_attn.o_proj.weight
-        o_proj_device = o_proj_weight.device
-        o_dtype = o_proj_weight.dtype
-
-        w_u_on_device = w_u.to(device=o_proj_device, dtype=o_dtype)
-        cand_ids = torch.tensor(cand_ids_list, device=o_proj_device)
-        yes_mask = torch.tensor(
-            [tid in yes_set for tid in cand_ids_list],
-            dtype=torch.bool,
-            device=o_proj_device,
-        )
-
         for h in range(num_heads):
             key = (l, h)
             if key not in fact_acts or key not in cf_acts:
                 continue
 
-            f_hd = torch.from_numpy(fact_acts[key]).to(device=o_proj_device, dtype=o_dtype)
-            c_hd = torch.from_numpy(cf_acts[key]).to(device=o_proj_device, dtype=o_dtype)
+            f_hd = torch.from_numpy(fact_acts[key])
+            c_hd = torch.from_numpy(cf_acts[key])
 
-            start = h * head_dim
-            end = (h + 1) * head_dim
-            o_slice = o_proj_weight[:, start:end]
+            f_logits = adapter.project_head_activations_to_logits(
+                l, h, f_hd, num_heads, head_dim
+            )
+            c_logits = adapter.project_head_activations_to_logits(
+                l, h, c_hd, num_heads, head_dim
+            )
 
-            f_logits = (f_hd @ o_slice.t()) @ w_u_on_device.t()
-            c_logits = (c_hd @ o_slice.t()) @ w_u_on_device.t()
+            cand_ids_on_device = cand_ids.to(f_logits.device)
+            yes_mask_on_device = yes_mask.to(f_logits.device)
+            f_probs = torch.softmax(f_logits[:, cand_ids_on_device].float(), dim=-1)
+            c_probs = torch.softmax(c_logits[:, cand_ids_on_device].float(), dim=-1)
 
-            f_probs = torch.softmax(f_logits[:, cand_ids].float(), dim=-1)
-            c_probs = torch.softmax(c_logits[:, cand_ids].float(), dim=-1)
-
-            p_y_f = f_probs[:, yes_mask].sum(dim=-1)
-            p_y_c = c_probs[:, yes_mask].sum(dim=-1)
+            p_y_f = f_probs[:, yes_mask_on_device].sum(dim=-1)
+            p_y_c = c_probs[:, yes_mask_on_device].sum(dim=-1)
 
             mean_diff_p_yes[l, h] = (p_y_f - p_y_c).abs().mean().item()
 
     return mean_diff_p_yes
+
+
+def _is_baseline_adapter(adapter_path: str) -> bool:
+    return adapter_path.strip().lower() in {"", "none", "baseline", "base"}
 
 
 def run_experiment(adapter_path, base_model_path, dataset_path, qid, batch_size):
@@ -222,7 +192,9 @@ def run_experiment(adapter_path, base_model_path, dataset_path, qid, batch_size)
         "auto", model=base_model, tokenizer=tokenizer, model_path=base_model_path
     )
 
-    config = get_model_config(base_model)
+    base_adapter = get_model_adapter(base_model, model_type=model_type, model_path=base_model_path)
+    print(f"Using architecture adapter: {base_adapter.family} ({base_adapter.head_activation_kind})")
+    config = base_adapter.get_config()
     num_layers = config["num_layers"]
     num_heads = config["num_heads"]
     head_dim = config["head_dim"]
@@ -244,19 +216,23 @@ def run_experiment(adapter_path, base_model_path, dataset_path, qid, batch_size)
     ds = PairedQidDataset(target_pairs, "prompt")
     dl = DataLoader(ds, batch_size=batch_size, shuffle=False)
 
-    model_peft = PeftModel.from_pretrained(base_model, adapter_path,
-        trust_remote_code=True)
-    model_peft.eval()
+    if _is_baseline_adapter(adapter_path):
+        eval_model = base_model
+    else:
+        eval_model = PeftModel.from_pretrained(base_model, adapter_path,
+            trust_remote_code=True)
+        eval_model.eval()
+    peft_adapter = get_model_adapter(eval_model, model_type=model_type, model_path=base_model_path)
 
     f_acts, c_acts = collect_acts(
-        model_peft, tokenizer, dl, model_type, device, num_layers, num_heads, head_dim
+        eval_model, tokenizer, dl, model_type, peft_adapter, device, num_layers, num_heads, head_dim
     )
     md = compute_md(
-        model_peft, tokenizer, f_acts, c_acts, num_layers, num_heads, head_dim
+        peft_adapter, tokenizer, f_acts, c_acts, num_layers, num_heads, head_dim
     )
 
     # Clean up
-    del model_peft
+    del eval_model
     del base_model
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -267,8 +243,10 @@ def run_experiment(adapter_path, base_model_path, dataset_path, qid, batch_size)
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--base_model_path", type=str, required=True)
-    parser.add_argument("--exp4_adapter", type=str, required=True)
-    parser.add_argument("--exp5_adapter", type=str, required=True)
+    parser.add_argument("--first_adapter", type=str, required=True)
+    parser.add_argument("--second_adapter", type=str, required=True)
+    parser.add_argument("--first_label", type=str, default="PFairFT")
+    parser.add_argument("--second_label", type=str, default="Global LoRA CE")
     parser.add_argument(
         "--dataset_path",
         type=str,
@@ -281,17 +259,30 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Run exp4
-    md_exp4 = run_experiment(
-        args.exp4_adapter, args.base_model_path, args.dataset_path, args.qid, args.batch_size
-    )
-    np.save(os.path.join(args.output_dir, "exp4_md.npy"), md_exp4)
+    metadata = {
+        "base_model_path": args.base_model_path,
+        "dataset_path": args.dataset_path,
+        "qid": args.qid,
+        "first_adapter": args.first_adapter,
+        "second_adapter": args.second_adapter,
+        "first_label": args.first_label,
+        "second_label": args.second_label,
+        "metric": "mean absolute factual-vs-counterfactual p_yes gap per head",
+    }
+    with open(os.path.join(args.output_dir, "metadata.json"), "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
 
-    # Run exp5
-    md_exp5 = run_experiment(
-        args.exp5_adapter, args.base_model_path, args.dataset_path, args.qid, args.batch_size
+    print(f"Running first adapter: {args.first_label}")
+    first_md = run_experiment(
+        args.first_adapter, args.base_model_path, args.dataset_path, args.qid, args.batch_size
     )
-    np.save(os.path.join(args.output_dir, "exp5_md.npy"), md_exp5)
+    np.save(os.path.join(args.output_dir, "first_md.npy"), first_md)
+
+    print(f"Running second adapter: {args.second_label}")
+    second_md = run_experiment(
+        args.second_adapter, args.base_model_path, args.dataset_path, args.qid, args.batch_size
+    )
+    np.save(os.path.join(args.output_dir, "second_md.npy"), second_md)
 
 
 if __name__ == "__main__":

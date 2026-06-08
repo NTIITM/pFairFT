@@ -24,7 +24,7 @@ from probability import (
     compute_p_yes_batch
 )
 from util import get_input_device
-from prompt import build_category_prompt, resolve_model_type, add_yes_no_instruction
+from prompt import resolve_model_type, add_yes_no_instruction
 from sampling import load_discrim_eval_pairs
 
 
@@ -71,7 +71,7 @@ def main():
         "--model_type",
         type=str,
         default="auto",
-        choices=["auto", "llama", "qwen", "deepseek"],
+        choices=["auto", "llama", "qwen", "deepseek", "olmoe", "jetmoe"],
     )
     parser.add_argument(
         "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
@@ -131,7 +131,7 @@ def main():
     os.makedirs(os.path.dirname(args.csv_path) or ".", exist_ok=True)
 
     print(f"Evaluating {prompt_type} for {model_name}...")
-    prompts = [add_yes_no_instruction(build_category_prompt(item[prompt_type], "")) for item in data]
+    prompts = [add_yes_no_instruction(item[prompt_type]) for item in data]
     p_yes_results = compute_p_yes_batch(
         model=model,
         tokenizer=tokenizer,

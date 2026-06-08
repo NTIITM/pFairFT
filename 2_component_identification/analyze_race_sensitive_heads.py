@@ -38,6 +38,7 @@ from hook import (
     create_config_detection_hook
 )
 from util import get_model_config
+from model_adapter import get_model_adapter
 from cache import DiskActivationCache
 from plot import plot_kl_heatmap, plot_elbow_point_vs_rank, plot_rank_heatmap
 from prompt import add_yes_no_instruction
@@ -125,7 +126,7 @@ def main():
         "--model_type",
         type=str,
         default="auto",
-        choices=["auto", "llama", "qwen", "deepseek"],
+        choices=["auto", "llama", "qwen", "deepseek", "olmoe", "jetmoe"],
         help="Model architecture for prompt formatting. Use 'auto' to infer from model/tokenizer.",
     )
     parser.add_argument("--random_sampling", action="store_true", default=False,
@@ -187,8 +188,11 @@ def main():
         )
         model.eval()
 
+        adapter = get_model_adapter(model, model_type=args.model_type, model_path=args.model_path)
+        print(f"Using architecture adapter: {adapter.family} ({adapter.head_activation_kind})")
+
         # 获取模型配置
-        config = get_model_config(model)
+        config = adapter.get_config()
         num_layers = config["num_layers"]
         num_heads = config["num_heads"]
         head_dim = config["head_dim"]
@@ -285,7 +289,7 @@ def main():
         
         # 注册临时 hook 检测
         detect_hook_fn = create_config_detection_hook(temp_buffer)
-        temp_hook = model.model.layers[0].self_attn.o_proj.register_forward_hook(detect_hook_fn)
+        temp_hook = adapter.register_config_detection_hook(temp_buffer)
         # 运行一个样本
         if len(fact_data) > 0:
             test_prompt = format_prompt_for_model(fact_data[0]["query"], model_type)
@@ -341,14 +345,7 @@ def main():
         # 注册 Hooks（仅用于 CF 跑）
         hooks = []
         for l in range(num_layers):
-            if hasattr(model.model.layers[l].self_attn, "o_proj"):
-                layer_module = model.model.layers[l].self_attn.o_proj
-            else:
-                raise ValueError("Cannot find o_proj")
-            hook_fn = get_activation_hook_for_intervention(
-                l, num_heads, head_dim, batch_activations_buffer
-            )
-            hooks.append(layer_module.register_forward_hook(hook_fn))
+            hooks.append(adapter.register_head_activation_hook(l, num_heads, head_dim, batch_activations_buffer))
 
         # 1) 先跑 CF，收集所有层的 head 激活
         for batch in tqdm(dataloader, desc="Collecting CF Activations"):
@@ -386,14 +383,7 @@ def main():
         print("Collecting Fact probabilities and activations...")
         hooks_fact = []
         for l in range(num_layers):
-            if hasattr(model.model.layers[l].self_attn, "o_proj"):
-                layer_module = model.model.layers[l].self_attn.o_proj
-            else:
-                raise ValueError("Cannot find o_proj")
-            hook_fn = get_activation_hook_for_intervention(
-                l, num_heads, head_dim, batch_activations_buffer
-            )
-            hooks_fact.append(layer_module.register_forward_hook(hook_fn))
+            hooks_fact.append(adapter.register_head_activation_hook(l, num_heads, head_dim, batch_activations_buffer))
         
         for batch in tqdm(dataloader, desc="Fact Inference"):
             indices = batch["index"]
@@ -513,8 +503,6 @@ def main():
         for l in range(num_layers):
             print(f"Processing Layer {l}/{num_layers - 1}...")
 
-            target_module = model.model.layers[l].self_attn.o_proj
-
             layer_head_kl_sum = torch.zeros(num_heads, dtype=torch.float64, device="cpu")
             total_samples = 0
 
@@ -537,7 +525,11 @@ def main():
                 # 当前层 CF 激活: [B, H, D]
                 cf_layer_data = cf_activations_cache.get_batch_layer(indices, l)
                 
-                target_device = next(target_module.parameters()).device
+                target_module = adapter.get_head_activation_module(l)
+                try:
+                    target_device = next(target_module.parameters()).device
+                except StopIteration:
+                    target_device = next(model.parameters()).device
                 fact_layer_tensor = torch.from_numpy(fact_layer_data).to(target_device)
                 cf_layer_tensor = torch.from_numpy(cf_layer_data).to(target_device)
 
@@ -559,11 +551,10 @@ def main():
                         print(f"  Intervention logic: Set all heads to fact activations, then set head {h} to counterfactual activation")
                         print("=" * 80)
                         first_intervention_printed = True
-                    hook_fn = get_patch_hook_modified(
-                        h, fact_layer_tensor, cf_layer_tensor, last_token_indices,
+                    hook_handle = adapter.register_head_patch_hook(
+                        l, h, fact_layer_tensor, cf_layer_tensor, last_token_indices,
                         num_heads, head_dim
                     )
-                    hook_handle = target_module.register_forward_pre_hook(hook_fn)
 
                     try:
                         with torch.no_grad():

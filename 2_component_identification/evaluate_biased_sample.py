@@ -9,7 +9,6 @@ import csv
 import json
 import os
 import sys
-from typing import Any, Dict, List, Tuple
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -19,14 +18,13 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src'))
 
 from prompt import (
-    build_category_prompt, add_yes_no_instruction,
-    format_prompt_for_model, resolve_model_type
+    add_yes_no_instruction, build_resume_prompt, resolve_model_type
 )
 from probability import (
     get_target_token_ids, YES_CANDIDATES, NO_CANDIDATES
 )
 from util import (
-    get_input_device, extract_race_from_query, get_model_config,
+    get_input_device, extract_race_from_query,
     create_counterfactual_by_race, compute_p_yes_for_prompt
 )
 
@@ -43,7 +41,7 @@ def main():
         "--model_type",
         type=str,
         default="auto",
-        choices=["auto", "llama", "qwen", "deepseek"],
+        choices=["auto", "llama", "qwen", "deepseek", "olmoe", "jetmoe"],
         help="Model architecture for prompt formatting. Use 'auto' to infer from model/tokenizer.",
     )
     parser.add_argument(
@@ -63,6 +61,13 @@ def main():
         type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
         help="Device to use (cuda or cpu).",
+    )
+    parser.add_argument(
+        "--resume_prompt_mode",
+        type=str,
+        default="summary_only",
+        choices=["summary_only", "category", "no_job_description"],
+        help="Resume prompt body before the strict Yes/No instruction.",
     )
     args = parser.parse_args()
     
@@ -104,7 +109,7 @@ def main():
     
     if not isinstance(dataset, list):
         raise ValueError("Dataset should be a list of records.")
-    
+
     print(f"Processing {len(dataset)} samples...")
     
     # 准备数据：从 summary 和 category 构建 query（不带 yes/no 指令）
@@ -124,11 +129,17 @@ def main():
         if not extracted_race:
             continue
         
+        query = build_resume_prompt(
+            summary=summary,
+            category=category,
+            mode=args.resume_prompt_mode,
+        )
+
         samples.append({
             "index": idx,
             "ID": item.get("ID", idx),
             "race": extracted_race,
-            "query": summary,  # 不带 yes/no 指令
+            "query": query,  # 不带 yes/no 指令
             "summary": summary,
             "category": category,
         })

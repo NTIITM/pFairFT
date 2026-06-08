@@ -10,7 +10,7 @@ import json
 import os
 import torch
 import numpy as np
-from datasets import load_dataset
+from datasets import DownloadConfig, load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
 from tqdm import tqdm
@@ -33,6 +33,7 @@ def main():
     parser.add_argument("--adapter_path", type=str, default="")
     parser.add_argument("--split", type=str, default="validation")
     parser.add_argument("--out_json", type=str, required=True)
+    parser.add_argument("--max_samples", type=int, default=0)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -49,10 +50,18 @@ def main():
     
     model.eval()
 
-    ds = load_dataset("cais/mmlu", "all", split=args.split, trust_remote_code=True)
+    download_config = DownloadConfig(local_files_only=os.getenv("HF_DATASETS_OFFLINE") == "1")
+    ds = load_dataset(
+        "cais/mmlu",
+        "all",
+        split=args.split,
+        download_config=download_config,
+    )
     
     # Evaluate on the entire split to get the true holistic CE (expected ~2.478)
     samples = list(ds)
+    if args.max_samples and args.max_samples > 0:
+        samples = samples[: args.max_samples]
     
     ce_losses = []
     loss_fct = torch.nn.CrossEntropyLoss()

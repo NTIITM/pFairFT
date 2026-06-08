@@ -45,6 +45,14 @@ def get_target_token_ids(tokenizer: Any, candidates: List[str]) -> List[int]:
         ids = tokenizer.encode(word, add_special_tokens=False)
         if ids:
             target_ids.add(ids[0])
+    tokenizer_name = str(getattr(tokenizer, "name_or_path", "")).lower()
+    tokenizer_class = tokenizer.__class__.__name__.lower()
+    if "jetmoe" in tokenizer_name or "jetmoe" in tokenizer_class:
+        normalized_candidates = {word.strip() for word in candidates if word.strip()}
+        for tid in range(len(tokenizer)):
+            decoded = tokenizer.decode([tid]).strip()
+            if decoded in normalized_candidates:
+                target_ids.add(tid)
     return list(target_ids)
 
 
@@ -71,6 +79,10 @@ def p_yes_from_logits_stable(
     Returns:
         Probability of "yes" (float between 0 and 1)
     """
+    overlap = set(yes_ids) & set(no_ids)
+    if overlap:
+        yes_ids = [tid for tid in yes_ids if tid not in overlap]
+        no_ids = [tid for tid in no_ids if tid not in overlap]
     if len(yes_ids) == 0 or len(no_ids) == 0:
         raise ValueError("yes_ids/no_ids must be non-empty.")
     if logits_row.dtype != torch.float32:
@@ -298,6 +310,12 @@ def _is_prompt_already_formatted(prompt: str) -> bool:
         "<think>",
         "</think>"
     ]
+
+    olmoe_markers = [
+        "<|user|>",
+        "<|assistant|>",
+        "<|system|>",
+    ]
     
     # 检查 Llama 格式：如果同时包含多个 Llama 标记，则认为已格式化
     llama_count = sum(1 for marker in llama_markers if marker in prompt)
@@ -307,6 +325,10 @@ def _is_prompt_already_formatted(prompt: str) -> bool:
     # 检查 Qwen 格式：如果同时包含多个 Qwen 标记，则认为已格式化
     qwen_count = sum(1 for marker in qwen_markers if marker in prompt)
     if qwen_count >= 2:
+        return True
+
+    olmoe_count = sum(1 for marker in olmoe_markers if marker in prompt)
+    if olmoe_count >= 2:
         return True
     
     return False

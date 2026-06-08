@@ -98,7 +98,7 @@ def add_yes_no_instruction(prompt: str) -> str:
     if prompt and not prompt[-1] in '.?!':
         prompt += "."
     # 拼接完整prompt：角色定义 → 原始需求 → 核心筛选规则 → 输出约束
-    return instruction_prefix + prompt + "\n" + high_selectivity_prompt + instruction_suffix
+    return instruction_prefix + prompt + "\n" + high_selectivity_prompt + "\n" + instruction_suffix
     # return instruction_prefix + prompt + "\n" + instruction_suffix
 
 # ============================================================================
@@ -153,6 +153,23 @@ def build_category_prompt_no_job_description(summary: str) -> str:
     return prompt
 
 
+def build_resume_prompt(summary: str, category: str = "", mode: str = "category") -> str:
+    """
+    Build the resume decision prompt body before adding the strict Yes/No instruction.
+
+    mode="summary_only" matches the biased-sample ranking and head-identification path.
+    mode="category" preserves the historical downstream-evaluation behavior.
+    """
+    mode_lower = (mode or "category").lower()
+    if mode_lower == "summary_only":
+        return summary
+    if mode_lower == "category":
+        return build_category_prompt(summary, category)
+    if mode_lower == "no_job_description":
+        return build_category_prompt_no_job_description(summary)
+    raise ValueError(f"Unknown resume prompt mode: {mode}")
+
+
 def build_prompt(
     resume_text: str,
     gender: str,
@@ -193,7 +210,7 @@ def format_prompt_for_model(user_prompt: str, model_type: str) -> str:
     """
     根据模型类型格式化 prompt。
     
-    支持 Llama、Qwen 和 DeepSeek 三种模型的 prompt 格式。
+    支持 Llama、Qwen、DeepSeek、OLMoE 和 JetMoE 的 prompt 格式。
     
     Args:
         user_prompt: 用户输入的 prompt
@@ -220,6 +237,18 @@ def format_prompt_for_model(user_prompt: str, model_type: str) -> str:
             f"User: {user_prompt}\n\n"
             f"Assistant: Answer: "
         )
+    elif model_type_lower == "olmoe":
+        return (
+            f"<|endoftext|><|user|>\n"
+            f"{user_prompt}\n"
+            f"<|assistant|>\n"
+        )
+    elif model_type_lower == "jetmoe":
+        return (
+            f"<|user|>\n"
+            f"{user_prompt}</s>\n"
+            f"<|assistant|>\n"
+        )
     return user_prompt  # default: return as-is
 
 
@@ -233,16 +262,16 @@ def resolve_model_type(
     解析模型类型，用于 prompt 格式化。
     
     Args:
-        requested: 请求的模型类型 ("auto" | "llama" | "qwen" | "deepseek")
+        requested: 请求的模型类型 ("auto" | "llama" | "qwen" | "deepseek" | "olmoe" | "jetmoe")
         model: HuggingFace 模型实例
         tokenizer: HuggingFace tokenizer 实例
         model_path: 模型路径
         
     Returns:
-        解析后的模型类型 ("llama", "qwen", 或 "deepseek")
+        解析后的模型类型 ("llama", "qwen", "deepseek", "olmoe", 或 "jetmoe")
     """
     requested_lower = requested.lower() if isinstance(requested, str) else ""
-    if requested_lower in {"llama", "qwen", "deepseek"}:
+    if requested_lower in {"llama", "qwen", "deepseek", "olmoe", "jetmoe"}:
         return requested_lower
 
     # auto: try model.config.model_type
@@ -250,6 +279,10 @@ def resolve_model_type(
     mt = getattr(cfg, "model_type", None) if cfg is not None else None
     if isinstance(mt, str):
         mt_l = mt.lower()
+        if "jetmoe" in mt_l:
+            return "jetmoe"
+        if "olmoe" in mt_l:
+            return "olmoe"
         if "deepseek" in mt_l:
             return "deepseek"
         if "qwen" in mt_l:
@@ -260,6 +293,10 @@ def resolve_model_type(
     # fallback: infer from model path
     if isinstance(model_path, str):
         mp = model_path.lower()
+        if "jetmoe" in mp:
+            return "jetmoe"
+        if "olmoe" in mp:
+            return "olmoe"
         if "deepseek" in mp:
             return "deepseek"
         if "qwen" in mp:

@@ -121,6 +121,13 @@ def get_model_config(model: Any) -> Dict[str, Any]:
         layers = model.layers
     else:
         raise ValueError("Cannot find model layers. Please check model architecture.")
+
+    def _get_attention(layer: Any) -> Optional[Any]:
+        if hasattr(layer, "self_attn"):
+            return layer.self_attn
+        if hasattr(layer, "self_attention"):
+            return layer.self_attention
+        return None
     
     # 优先从 model.config 获取配置
     if hasattr(model, "config"):
@@ -133,10 +140,12 @@ def get_model_config(model: Any) -> Dict[str, Any]:
             config["hidden_size"] = model_config.d_model
         else:
             # 尝试从第一层推断
-            if hasattr(layers[0], "self_attn"):
-                attn = layers[0].self_attn
+            attn = _get_attention(layers[0])
+            if attn is not None:
                 if hasattr(attn, "q_proj"):
                     config["hidden_size"] = attn.q_proj.in_features
+                elif hasattr(attn, "kv_proj"):
+                    config["hidden_size"] = attn.kv_proj.in_features
                 elif hasattr(attn, "embed_dim"):
                     config["hidden_size"] = attn.embed_dim
                 else:
@@ -164,7 +173,7 @@ def get_model_config(model: Any) -> Dict[str, Any]:
                 config["num_heads"] = model_config.num_key_value_heads
         else:
             # 尝试从层中推断
-            example_attn = layers[0].self_attn if hasattr(layers[0], "self_attn") else None
+            example_attn = _get_attention(layers[0])
             if example_attn is not None:
                 if hasattr(example_attn, "num_heads"):
                     config["num_heads"] = example_attn.num_heads
@@ -193,6 +202,8 @@ def get_model_config(model: Any) -> Dict[str, Any]:
                 config["is_mla"] = True
             elif hasattr(model_config, "head_dim"):
                 config["head_dim"] = model_config.head_dim
+            elif hasattr(model_config, "kv_channels"):
+                config["head_dim"] = model_config.kv_channels
             elif hasattr(model_config, "d_head"):
                 config["head_dim"] = model_config.d_head
             else:
@@ -204,10 +215,12 @@ def get_model_config(model: Any) -> Dict[str, Any]:
                 config["head_dim"] = config["hidden_size"] // config["num_heads"]
     else:
         # 如果没有 config，尝试从层结构推断
-        if hasattr(layers[0], "self_attn"):
-            attn = layers[0].self_attn
+        attn = _get_attention(layers[0])
+        if attn is not None:
             if hasattr(attn, "q_proj"):
                 config["hidden_size"] = attn.q_proj.in_features
+            elif hasattr(attn, "kv_proj"):
+                config["hidden_size"] = attn.kv_proj.in_features
             elif hasattr(attn, "embed_dim"):
                 config["hidden_size"] = attn.embed_dim
             else:

@@ -1,17 +1,17 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""EXP23: Plot head metric comparing exp4 vs exp5 on QID 33.
+"""EXP23: Plot head metric comparing two adapters on a QID subset.
 
 Plotting rule (per user request, following exp21/plot_head_expression_exp21.py style):
 - Read `sensitive_heads_json`.
 - Non-sensitive heads: white small circles.
 - Sensitive heads:
-  - exp5: red dots.
-  - exp4: stars.
+  - second adapter: red dots.
+  - first adapter: stars.
 
 Input files under `input_dir`:
-- exp4_md.npy
-- exp5_md.npy
+- first_md.npy
+- second_md.npy
 
 Output: PDF.
 """
@@ -69,6 +69,8 @@ def main() -> None:
     p.add_argument("--input_dir", type=str, required=True)
     p.add_argument("--output_path", type=str, required=True)
     p.add_argument("--sensitive_heads_json", type=str, required=True)
+    p.add_argument("--first_label", type=str, default="PFairFT")
+    p.add_argument("--second_label", type=str, default="Global LoRA CE")
     args = p.parse_args()
 
     plt.rcParams["font.family"] = "Times New Roman"
@@ -76,16 +78,16 @@ def main() -> None:
 
     selected = _load_selected_heads(args.sensitive_heads_json)
 
-    md_exp4 = np.load(os.path.join(args.input_dir, "exp4_md.npy"))
-    md_exp5 = np.load(os.path.join(args.input_dir, "exp5_md.npy"))
+    first_md = np.load(os.path.join(args.input_dir, "first_md.npy"))
+    second_md = np.load(os.path.join(args.input_dir, "second_md.npy"))
 
-    if md_exp4.shape != md_exp5.shape:
-        raise ValueError(f"Shape mismatch: exp4 {md_exp4.shape} vs exp5 {md_exp5.shape}")
+    if first_md.shape != second_md.shape:
+        raise ValueError(f"Shape mismatch: first {first_md.shape} vs second {second_md.shape}")
 
     fig, ax = plt.subplots(1, 1, figsize=(6.5, 3.2), sharex=False, sharey=False)
 
-    # Non-sensitive heads (white small balls) - use exp5 values as background coordinates
-    xs_o, ys_o, xs_s5, ys_s5 = _split_points(md_exp5, selected)
+    # Non-sensitive heads use second-adapter values as background coordinates.
+    xs_o, ys_o, xs_second, ys_second = _split_points(second_md, selected)
     if xs_o:
         ax.scatter(
             xs_o,
@@ -97,37 +99,37 @@ def main() -> None:
             label="Other heads",
         )
 
-    # Sensitive heads: exp5 red dots
-    if xs_s5:
+    # Sensitive heads: second adapter red dots.
+    if xs_second:
         ax.scatter(
-            xs_s5,
-            ys_s5,
+            xs_second,
+            ys_second,
             c="red",
             edgecolors="black",
             alpha=0.9,
             s=35,
-            label="Key Heads (Global)",
+            label=f"Key Heads ({args.second_label})",
         )
 
-    # Sensitive heads: exp4 stars (same head indices, y from exp4)
-    xs_s4, ys_s4 = [], []
-    L, H = md_exp4.shape
+    # Sensitive heads: first adapter stars at the same head indices.
+    xs_first, ys_first = [], []
+    L, H = first_md.shape
     for (l, h) in selected:
         if 0 <= l < L and 0 <= h < H:
-            xs_s4.append(l)
-            ys_s4.append(float(md_exp4[l, h]))
+            xs_first.append(l)
+            ys_first.append(float(first_md[l, h]))
 
-    if xs_s4:
+    if xs_first:
         ax.scatter(
-            xs_s4,
-            ys_s4,
+            xs_first,
+            ys_first,
             marker="*",
             s=110,
             facecolors="none",
             edgecolors="black",
             linewidths=1.5,
             alpha=0.95,
-            label="Key Heads (pFairFT)",
+            label=f"Key Heads ({args.first_label})",
         )
 
     ax.set_ylabel(r"$\mathcal{I}_{l,h}$", fontweight="bold")

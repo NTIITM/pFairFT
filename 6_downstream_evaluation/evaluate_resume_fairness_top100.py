@@ -26,7 +26,7 @@ from peft import PeftModel
 # Import utilities from parent directory
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src'))
 
-from prompt import add_yes_no_instruction, build_category_prompt, format_prompt_for_model, resolve_model_type
+from prompt import add_yes_no_instruction, build_resume_prompt, format_prompt_for_model, resolve_model_type
 from probability import (
     YES_CANDIDATES,
     NO_CANDIDATES,
@@ -80,7 +80,14 @@ def main() -> None:
     parser.add_argument("--output_csv_path", type=str, required=True,
                         help="Where to write per-sample results CSV.")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--model_type", type=str, default="auto", choices=["auto", "llama", "qwen", "deepseek"])
+    parser.add_argument("--model_type", type=str, default="auto", choices=["auto", "llama", "qwen", "deepseek", "olmoe", "jetmoe"])
+    parser.add_argument(
+        "--resume_prompt_mode",
+        type=str,
+        default="category",
+        choices=["summary_only", "category", "no_job_description"],
+        help="Resume prompt body before the strict Yes/No instruction.",
+    )
     args = parser.parse_args()
 
     os.makedirs(os.path.dirname(args.output_csv_path) or ".", exist_ok=True)
@@ -105,13 +112,16 @@ def main() -> None:
         summary = item.get("summary", "")
         category = item.get("category", "")
         race = item.get("race", "")
-        if not summary or not category:
+        if not summary:
             continue
         orig_index = int(item.get("_orig_index", item.get("ID", 0)))
         indices.append(orig_index)
 
-        # 构建事实 query（方式A）
-        base_query = build_category_prompt(summary, category)
+        base_query = build_resume_prompt(
+            summary=summary,
+            category=category,
+            mode=args.resume_prompt_mode,
+        )
         extracted_race = extract_race_from_query(base_query) or race or "Unknown"
 
         fact_item = {

@@ -98,7 +98,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 from sampling import sample_resume_data_by_race, load_samples_by_csv_indices
 from util import create_counterfactual_by_race, get_model_config
 from prompt import (
-    build_category_prompt,
+    build_resume_prompt,
     add_yes_no_instruction,
     format_prompt_for_model,
     resolve_model_type,
@@ -113,6 +113,7 @@ from hook import (
     get_last_token_indices_safe,
     create_config_detection_hook,
 )
+from model_adapter import get_model_adapter
 
 
 def set_seed(seed: int = 42) -> None:
@@ -256,7 +257,7 @@ def build_fact_and_counterfactual_dataset(
         dataset = json.load(f)
 
     if not isinstance(dataset, list):
-        raise ValueError("Resume dataset should be a list of records.")
+        raise ValueError("Dataset should be a list of records.")
 
     print(f"Total records in JSON: {len(dataset)}")
 
@@ -279,12 +280,12 @@ def build_fact_and_counterfactual_dataset(
         print(f"Sampled {len(sampled_data)} records for fine-tuning.")
 
     fact_data: List[Dict] = []
+    cf_data: List[Dict] = []
     for item in sampled_data:
         summary = item.get("summary", "")
         race = item.get("race", "")
-        query = summary
         fact_item = {
-            "query": query,
+            "query": summary,
             "summary": summary,
             "race": race,
             "ID": item.get("ID", 0),
@@ -294,7 +295,6 @@ def build_fact_and_counterfactual_dataset(
     print(f"Fact samples after filtering: {len(fact_data)}")
 
     print("Creating counterfactual data (flipping race)...")
-    cf_data: List[Dict] = []
     for fact_item in fact_data:
         cf_item = create_counterfactual_by_race(fact_item)
         cf_data.append(cf_item)
@@ -336,8 +336,8 @@ def compute_targeted_kl(
     """
     只在指定 token（例如 Yes/No）对应的 logits 上计算 KL 散度。
     """
-    f_logits = fact_logits[:, target_ids]
-    c_logits = cf_logits[:, target_ids]
+    f_logits = fact_logits[:, target_ids].float()
+    c_logits = cf_logits[:, target_ids].float()
 
     f_probs = F.softmax(f_logits, dim=-1)
     c_probs = F.softmax(c_logits, dim=-1)
@@ -359,6 +359,23 @@ def get_last_token_logits(
     last_logits = logits[batch_indices, last_token_indices, :]
 
     return last_logits
+
+
+def compute_causal_lm_ce_from_logits(
+    logits: torch.Tensor,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Compute causal LM CE from an existing forward pass."""
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = input_ids[..., 1:].contiguous()
+    shift_mask = attention_mask[..., 1:].contiguous()
+    shift_labels = shift_labels.masked_fill(shift_mask == 0, -100)
+    return F.cross_entropy(
+        shift_logits.view(-1, shift_logits.size(-1)),
+        shift_labels.view(-1),
+        ignore_index=-100,
+    )
 
 
 # 不再使用全局 _activation_cache，改为使用 batch_activations_buffer（与 exp2_old 一致）
@@ -444,7 +461,12 @@ def compute_fairness_loss(
         return torch.tensor(0.0, device=device)
 
 
-def create_head_masks(selected_heads: List[Dict], num_heads: int, head_dim: int) -> Dict[str, torch.Tensor]:
+def create_head_masks(
+    selected_heads: List[Dict],
+    num_heads: int,
+    head_dim: int,
+    layer_key_fn=None,
+) -> Dict[str, torch.Tensor]:
     """
     为选定的头创建梯度 Mask。
     
@@ -470,7 +492,7 @@ def create_head_masks(selected_heads: List[Dict], num_heads: int, head_dim: int)
             mask[h_idx * head_dim : (h_idx + 1) * head_dim] = 1.0
             
         # 存储该层对应的 mask
-        layer_key = f"layers.{layer_idx}.self_attn"
+        layer_key = layer_key_fn(layer_idx) if layer_key_fn is not None else f"layers.{layer_idx}.self_attn"
         head_masks[layer_key] = mask
             
     return head_masks
@@ -497,6 +519,7 @@ def train_epoch(
     head_dim: int,
     head_masks: Optional[Dict[str, torch.Tensor]] = None,
     loss_type: str = "kl",
+    resume_prompt_mode: str = "category",
 ) -> Dict[str, float]:
     """训练一个 epoch，支持 KL 或 Fairness 损失。"""
     model.train()
@@ -513,12 +536,11 @@ def train_epoch(
         raw_fact_queries = batch["fact_query"]
         raw_cf_queries = batch["cf_query"]
 
-        # 构造 prompt
         fact_base_prompts = [
-            build_category_prompt(summary, "") for summary in raw_fact_queries
+            build_resume_prompt(summary, mode=resume_prompt_mode) for summary in raw_fact_queries
         ]
         cf_base_prompts = [
-            build_category_prompt(summary, "") for summary in raw_cf_queries
+            build_resume_prompt(summary, mode=resume_prompt_mode) for summary in raw_cf_queries
         ]
 
         fact_instruction_prompts = [
@@ -588,6 +610,9 @@ def train_epoch(
         # 前向：反事实
         cf_outputs = model(input_ids=cf_input_ids, attention_mask=cf_attention_mask)
         cf_logits = cf_outputs.logits
+        # Hooks also capture CF activations, but the fairness term only uses fact
+        # activations. Drop these unused graph references before backward.
+        batch_activations_buffer.clear()
 
         # 取最后一个 token 的 logits
         fact_last_logits = get_last_token_logits(
@@ -598,39 +623,46 @@ def train_epoch(
         # 计算 KL 损失
         kl_loss = compute_targeted_kl(fact_last_logits, cf_last_logits, target_ids)
 
+        ce_loss = None
+
         # 总损失：根据 loss_type 选择
         if loss_type == "kl":
             loss = kl_loss
         elif loss_type == "fairness":
             loss = fairness_loss * fairness_lambda
+        elif loss_type == "fairness_kl":
+            loss = fairness_loss * fairness_lambda + kl_loss
         elif loss_type == "kl_ce":
-            # 计算全序列 CE Loss (Next Token Prediction)
-            # 对 fact 样本计算 CE
-            fact_labels = fact_input_ids.clone()
-            fact_labels[fact_attention_mask == 0] = -100
-            
-            fact_outputs_ce = model(input_ids=fact_input_ids, attention_mask=fact_attention_mask, labels=fact_labels)
-            ce_loss = fact_outputs_ce.loss
-            
-            cf_labels = cf_input_ids.clone()
-            cf_labels[cf_attention_mask == 0] = -100
-            cf_outputs_ce = model(input_ids=cf_input_ids, attention_mask=cf_attention_mask, labels=cf_labels)
-            ce_loss = (ce_loss + cf_outputs_ce.loss) / 2.0
-            
+            # Reuse fact/cf logits instead of running two extra forwards.
+            fact_ce_loss = compute_causal_lm_ce_from_logits(
+                fact_logits, fact_input_ids, fact_attention_mask
+            )
+            cf_ce_loss = compute_causal_lm_ce_from_logits(
+                cf_logits, cf_input_ids, cf_attention_mask
+            )
+            ce_loss = (fact_ce_loss + cf_ce_loss) / 2.0
             loss = kl_loss + ce_loss * fairness_lambda
 
+        elif loss_type == "fairness_kl_ce":
+            # PFairFT-KL-CE: affine fairness loss + KL divergence + CE.
+            fact_ce_loss = compute_causal_lm_ce_from_logits(
+                fact_logits, fact_input_ids, fact_attention_mask
+            )
+            cf_ce_loss = compute_causal_lm_ce_from_logits(
+                cf_logits, cf_input_ids, cf_attention_mask
+            )
+            ce_loss = (fact_ce_loss + cf_ce_loss) / 2.0
+            loss = fairness_loss * fairness_lambda + kl_loss + ce_loss
+
         elif loss_type == "fairness_ce":
-            # 计算全序列 CE Loss
-            fact_labels = fact_input_ids.clone()
-            fact_labels[fact_attention_mask == 0] = -100
-            fact_outputs_ce = model(input_ids=fact_input_ids, attention_mask=fact_attention_mask, labels=fact_labels)
-            ce_loss = fact_outputs_ce.loss
-            
-            cf_labels = cf_input_ids.clone()
-            cf_labels[cf_attention_mask == 0] = -100
-            cf_outputs_ce = model(input_ids=cf_input_ids, attention_mask=cf_attention_mask, labels=cf_labels)
-            ce_loss = (ce_loss + cf_outputs_ce.loss) / 2.0
-            
+            # Reuse fact/cf logits instead of running two extra forwards.
+            fact_ce_loss = compute_causal_lm_ce_from_logits(
+                fact_logits, fact_input_ids, fact_attention_mask
+            )
+            cf_ce_loss = compute_causal_lm_ce_from_logits(
+                cf_logits, cf_input_ids, cf_attention_mask
+            )
+            ce_loss = (fact_ce_loss + cf_ce_loss) / 2.0
             loss = fairness_loss * fairness_lambda + ce_loss
 
         loss = loss / max(1, gradient_accumulation_steps)
@@ -662,8 +694,23 @@ def train_epoch(
                 "loss": f"{loss.item() * max(1, gradient_accumulation_steps):.4f}",
                 "kl": f"{kl_loss.item():.4f}",
                 "fair": f"{fairness_loss.item():.4f}",
+                "ce": f"{ce_loss.item():.4f}" if ce_loss is not None else "n/a",
                 "avg_loss": f"{total_loss / max(num_batches, 1):.4f}",
             }
+        )
+
+        del (
+            fact_inputs,
+            cf_inputs,
+            fact_outputs,
+            cf_outputs,
+            fact_logits,
+            cf_logits,
+            fact_last_logits,
+            cf_last_logits,
+            loss,
+            kl_loss,
+            fairness_loss,
         )
 
     avg_loss = total_loss / max(num_batches, 1)
@@ -755,6 +802,13 @@ def main():
         help="Sample size when using CSV.",
     )
     parser.add_argument(
+        "--resume_prompt_mode",
+        type=str,
+        default="category",
+        choices=["summary_only", "category", "no_job_description"],
+        help="Resume prompt body before the strict Yes/No instruction.",
+    )
+    parser.add_argument(
         "--lora_rank",
         type=int,
         default=8,
@@ -812,8 +866,12 @@ def main():
         "--loss_type",
         type=str,
         default="kl",
-        choices=["kl", "fairness", "kl_ce", "fairness_ce"],
-        help="Loss type: 'kl' (KL divergence), 'fairness' (affine fairness offset), 'kl_ce' (KL + CE), 'fairness_ce' (Fairness + CE).",
+        choices=["kl", "fairness", "fairness_kl", "kl_ce", "fairness_kl_ce", "fairness_ce"],
+        help=(
+            "Loss type: 'kl' (KL divergence), 'fairness' (affine fairness offset), "
+            "'fairness_kl' (affine fairness + KL), 'kl_ce' (legacy KL + CE), "
+            "'fairness_kl_ce' (affine fairness + KL + CE), 'fairness_ce' (affine fairness + CE)."
+        ),
     )
     parser.add_argument(
         "--fairness_lambda",
@@ -850,59 +908,62 @@ def main():
     set_seed(args.seed)
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # 1. 先加载模型以获取 head_dim（用于验证公平锚点的维度）
-    # 使用与 exp2_old 相同的方法：先用 get_model_config，再用 create_config_detection_hook 检测
-    temp_tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
-    if temp_tokenizer.pad_token is None:
-        temp_tokenizer.pad_token = temp_tokenizer.eos_token
-    temp_tokenizer.padding_side = "right"
-    
-    temp_model = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
-        device_map="cpu",  # 临时加载到 CPU
-        torch_dtype=torch.float32,
-        low_cpu_mem_usage=True, trust_remote_code=True
-    )
-    
-    # 先用 get_model_config 获取初始配置
-    temp_config = get_model_config(temp_model)
-    initial_head_dim = temp_config["head_dim"]
-    initial_num_heads = temp_config["num_heads"]
-    print(f"Initial config from get_model_config: num_heads={initial_num_heads}, head_dim={initial_head_dim}")
-    
-    # 再用 create_config_detection_hook 检测实际配置（与 exp2_old 一致）
-    temp_buffer = {}
-    detect_hook_fn = create_config_detection_hook(temp_buffer)
-    
-    # 运行一个测试样本来检测配置
-    test_prompt = "Test prompt for config detection"
-    test_inputs = temp_tokenizer([test_prompt], return_tensors="pt", padding=True, truncation=True, add_special_tokens=False)
-    temp_hook = temp_model.model.layers[0].self_attn.o_proj.register_forward_hook(detect_hook_fn)
-    with torch.no_grad():
-        _ = temp_model(**test_inputs)
-    temp_hook.remove()
-    
-    # 使用检测到的配置（如果检测成功）
-    if 'head_dim' in temp_buffer and temp_buffer['head_dim'] is not None:
-        detected_head_dim = temp_buffer['head_dim']
-        detected_num_heads = temp_buffer['num_heads']
-        print(f"Detected config from create_config_detection_hook: num_heads={detected_num_heads}, head_dim={detected_head_dim}")
-        
-        if detected_head_dim != initial_head_dim or detected_num_heads != initial_num_heads:
-            print(f"Configuration mismatch detected!")
-            print(f"  Initial: num_heads={initial_num_heads}, head_dim={initial_head_dim}")
-            print(f"  Detected: num_heads={detected_num_heads}, head_dim={detected_head_dim}")
-            print(f"Using detected values (consistent with exp2_old)")
-            expected_head_dim = detected_head_dim
-        else:
-            expected_head_dim = initial_head_dim
+    # 1. 先确定 head_dim（用于验证公平锚点的维度）。
+    # JetMoE 的 scattermoe Triton kernel 不能在 CPU 上跑；额外加载一次完整临时
+    # GPU 模型又容易造成显存碎片。因此 JetMoE 分支跳过临时整模型 forward，
+    # 后续真正训练模型加载后仍会做一次实际配置检测。
+    if "jetmoe" in args.model_path.lower():
+        expected_head_dim = None
+        print("Skipping temporary full-model config forward for JetMoE; will validate dimensions from results.pkl and the training model.")
     else:
-        print(f"Warning: Could not detect config from hook. Using initial values.")
-        expected_head_dim = initial_head_dim
-    
-    print(f"Final expected head_dim: {expected_head_dim}")
-    del temp_model, temp_tokenizer
-    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        temp_tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+        if temp_tokenizer.pad_token is None:
+            temp_tokenizer.pad_token = temp_tokenizer.eos_token
+        temp_tokenizer.padding_side = "right"
+
+        temp_model = AutoModelForCausalLM.from_pretrained(
+            args.model_path,
+            device_map="cpu",
+            torch_dtype=torch.float32,
+            low_cpu_mem_usage=True, trust_remote_code=True
+        )
+
+        temp_adapter = get_model_adapter(temp_model, model_type="auto", model_path=args.model_path)
+        print(f"Temp architecture adapter: {temp_adapter.family} ({temp_adapter.head_activation_kind})")
+
+        temp_config = temp_adapter.get_config()
+        initial_head_dim = temp_config["head_dim"]
+        initial_num_heads = temp_config["num_heads"]
+        print(f"Initial config from get_model_config: num_heads={initial_num_heads}, head_dim={initial_head_dim}")
+
+        temp_buffer = {}
+        test_prompt = "Test prompt for config detection"
+        test_inputs = temp_tokenizer([test_prompt], return_tensors="pt", padding=True, truncation=True, add_special_tokens=False)
+        temp_hook = temp_adapter.register_config_detection_hook(temp_buffer)
+        with torch.no_grad():
+            _ = temp_model(**test_inputs)
+        temp_hook.remove()
+
+        if 'head_dim' in temp_buffer and temp_buffer['head_dim'] is not None:
+            detected_head_dim = temp_buffer['head_dim']
+            detected_num_heads = temp_buffer['num_heads']
+            print(f"Detected config from create_config_detection_hook: num_heads={detected_num_heads}, head_dim={detected_head_dim}")
+
+            if detected_head_dim != initial_head_dim or detected_num_heads != initial_num_heads:
+                print(f"Configuration mismatch detected!")
+                print(f"  Initial: num_heads={initial_num_heads}, head_dim={initial_head_dim}")
+                print(f"  Detected: num_heads={detected_num_heads}, head_dim={detected_head_dim}")
+                print(f"Using detected values (consistent with exp2_old)")
+                expected_head_dim = detected_head_dim
+            else:
+                expected_head_dim = initial_head_dim
+        else:
+            print(f"Warning: Could not detect config from hook. Using initial values.")
+            expected_head_dim = initial_head_dim
+
+        print(f"Final expected head_dim: {expected_head_dim}")
+        del temp_model, temp_tokenizer, temp_adapter, test_inputs
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
     # 2. 加载公平性锚点信息（传入 head_dim 进行验证）
     fairness_info = load_fairness_anchors(args.heads_analysis_dir, expected_head_dim=expected_head_dim)
@@ -976,8 +1037,11 @@ def main():
     )
     print(f"Resolved model_type: {model_type}")
 
+    adapter = get_model_adapter(model, model_type=model_type, model_path=args.model_path)
+    print(f"Architecture adapter: {adapter.family} ({adapter.head_activation_kind})")
+
     # 获取模型配置（与 exp2_old 一致：先用 get_model_config，再用 create_config_detection_hook 检测）
-    config = get_model_config(model)
+    config = adapter.get_config()
     num_heads = config["num_heads"]
     head_dim = config["head_dim"]
     print(f"Initial model config: num_heads={num_heads}, head_dim={head_dim}")
@@ -992,8 +1056,8 @@ def main():
     if len(fact_data) > 0:
         test_prompt = format_prompt_for_model(fact_data[0]["query"], model_type)
         test_inputs = tokenizer([test_prompt], return_tensors="pt", padding=True, truncation=True, add_special_tokens=False).to(device)
-        # 在应用 LoRA 之前，使用 model.model.layers（与 exp2_old 一致）
-        temp_hook = model.model.layers[0].self_attn.o_proj.register_forward_hook(detect_hook_fn)
+        # 在应用 LoRA 之前，使用 adapter 检测真实 head 切分
+        temp_hook = adapter.register_config_detection_hook(temp_buffer)
         with torch.no_grad():
             _ = model(**test_inputs)
         temp_hook.remove()
@@ -1030,7 +1094,7 @@ def main():
         lora_dropout=args.lora_dropout,
         bias="none",
         task_type="CAUSAL_LM",
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        target_modules=adapter.lora_target_modules(),
     )
     model = get_peft_model(model, lora_config)
     print("Applied LoRA. Trainable parameters:")
@@ -1038,7 +1102,7 @@ def main():
 
     # 创建 Head Masks 以实现精准微调约束
     print(f"Creating gradient masks for {len(selected_heads)} selected heads...")
-    head_masks = create_head_masks(selected_heads, num_heads, head_dim)
+    head_masks = create_head_masks(selected_heads, num_heads, head_dim, adapter.head_mask_layer_key)
 
     if device_map is None:
         model.to(device)
@@ -1068,64 +1132,18 @@ def main():
     selected_layers = set(head_info["layer"] for head_info in selected_heads)
     batch_activations_buffer: Dict[int, torch.Tensor] = {}
     
-    # 确定正确的模型结构路径
-    # PEFT 包装后的结构：
-    # - model: PeftModelForCausalLM
-    # - model.base_model: LoraModel
-    # - model.base_model.model: LlamaForCausalLM
-    # - model.base_model.model.model: LlamaModel (这个才有 layers)
-    layers_module = None
-    
-    # 尝试不同的路径
-    if hasattr(model, "base_model"):
-        base_model = model.base_model
-        
-        # 路径1: model.base_model.model.model.layers (PEFT 包装的 Llama)
-        if hasattr(base_model, "model"):
-            inner_model = base_model.model  # LlamaForCausalLM
-            if hasattr(inner_model, "model"):
-                llama_model = inner_model.model  # LlamaModel
-                if hasattr(llama_model, "layers"):
-                    layers_module = llama_model.layers
-                    print(f"Found layers at: model.base_model.model.model.layers (count: {len(layers_module)})")
-            
-            # 路径2: model.base_model.model.layers (如果 LlamaForCausalLM 直接有 layers)
-            if layers_module is None and hasattr(inner_model, "layers"):
-                layers_module = inner_model.layers
-                print(f"Found layers at: model.base_model.model.layers (count: {len(layers_module)})")
-        
-        # 路径3: model.base_model.layers (如果 base_model 直接有 layers)
-        if layers_module is None and hasattr(base_model, "layers"):
-            layers_module = base_model.layers
-            print(f"Found layers at: model.base_model.layers (count: {len(layers_module)})")
-    
-    # 路径4: model.model.layers (如果没有 PEFT 包装)
-    if layers_module is None and hasattr(model, "model") and hasattr(model.model, "layers"):
-        layers_module = model.model.layers
-        print(f"Found layers at: model.model.layers (count: {len(layers_module)})")
-    
-    if layers_module is None:
-        raise ValueError(
-            "Cannot find layers in model structure. "
-            f"Model type: {type(model)}, "
-            f"Has base_model: {hasattr(model, 'base_model')}, "
-            f"Has model: {hasattr(model, 'model')}"
-        )
+    # PEFT 包装后重新创建 adapter，使模块遍历落到 base model。
+    adapter = get_model_adapter(model, model_type=model_type, model_path=args.model_path)
+    layers_module = adapter.get_layers()
+    print(f"Found layers through adapter (count: {len(layers_module)})")
     
     for layer_idx in selected_layers:
         try:
             if layer_idx >= len(layers_module):
                 raise ValueError(f"Layer {layer_idx} out of range (total layers: {len(layers_module)})")
-            
-            if hasattr(layers_module[layer_idx].self_attn, "o_proj"):
-                layer_module = layers_module[layer_idx].self_attn.o_proj
-            else:
-                raise ValueError(f"Cannot find o_proj for layer {layer_idx}")
-            
-            hook_fn = get_activation_hook_for_intervention(
+            hook_handle = adapter.register_head_activation_hook(
                 layer_idx, num_heads, head_dim, batch_activations_buffer
             )
-            hook_handle = layer_module.register_forward_hook(hook_fn)
             activation_hooks.append(hook_handle)
         except Exception as e:
             print(f"Warning: Could not register hook for layer {layer_idx}: {e}")
@@ -1184,6 +1202,7 @@ def main():
             head_dim=head_dim,
             head_masks=head_masks,
             loss_type=args.loss_type,
+            resume_prompt_mode=args.resume_prompt_mode,
         )
         training_history.append({"epoch": epoch + 1, **epoch_metrics})
         print(
@@ -1218,6 +1237,7 @@ def main():
         "batch_size": args.batch_size,
         "learning_rate": args.learning_rate,
         "fairness_lambda": args.fairness_lambda,
+        "loss_type": args.loss_type,
         "num_selected_heads": len(selected_heads),
         "training_history": training_history,
         "config": {

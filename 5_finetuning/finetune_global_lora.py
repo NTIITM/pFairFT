@@ -38,6 +38,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 
 from sampling import sample_resume_data_by_race, load_samples_by_csv_indices  # type: ignore
 from util import create_counterfactual_by_race  # type: ignore
+from model_adapter import get_model_adapter  # type: ignore
 
 def set_seed(seed: int = 42) -> None:
     """设置随机种子以确保可重复性。"""
@@ -273,6 +274,13 @@ def main():
         help="Resume dataset JSON path.",
     )
     parser.add_argument(
+        "--model_type",
+        type=str,
+        default="auto",
+        choices=["auto", "llama", "qwen", "deepseek", "olmoe", "jetmoe"],
+        help="Model family used to choose architecture-specific LoRA target modules.",
+    )
+    parser.add_argument(
         "--output_dir",
         type=str,
         default="/home/common1/hwluo/project/pFairFT/exp5/finetune_output",
@@ -475,14 +483,16 @@ def main():
 
     # 根据 train_type 决定是否启用 LoRA
     if args.train_type == "lora":
+        adapter = get_model_adapter(model, model_type=args.model_type, model_path=args.model_path)
+        target_modules = adapter.lora_target_modules()
+        print(f"Using LoRA target modules from model adapter: {target_modules}")
         lora_config = LoraConfig(
             r=args.lora_rank,
             lora_alpha=args.lora_alpha,
             lora_dropout=args.lora_dropout,
             bias="none",
             task_type="CAUSAL_LM",
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                            "gate_proj", "up_proj", "down_proj"],
+            target_modules=target_modules,
         )
         model = get_peft_model(model, lora_config)
         print("Using LoRA adapter. Trainable parameters:")
@@ -591,6 +601,8 @@ def main():
             "random_sampling": args.random_sampling,
             "bf16": args.bf16,
             "fp16": args.fp16,
+            "model_type": args.model_type,
+            "lora_target_modules": target_modules if args.train_type == "lora" else [],
         },
     }
 
@@ -610,4 +622,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -27,7 +27,7 @@ echo "============================================"
 echo "Backing up old results to ${BACKUP_DIR}..."
 mkdir -p "${BACKUP_DIR}"
 
-for d in pfairft precision_fairness pfairft_ce global downstream_evaluation; do
+for d in pfairft precision_fairness global downstream_evaluation; do
     if [ -d "${RESULTS_ROOT}/${d}" ]; then
         echo "  Backing up ${d}..."
         cp -r "${RESULTS_ROOT}/${d}" "${BACKUP_DIR}/${d}"
@@ -200,43 +200,43 @@ else
 fi
 
 # ================================================================
-# PFairFT-CE (Combined KL + CE on sensitive heads)
+# PFairFT (CE + affine-transform fairness loss on selected heads)
 # ================================================================
-PFAIRFT_KL_CE_DIR="${RESULTS_ROOT}/pfairft_ce"
+PFAIRFT_DIR="${RESULTS_ROOT}/pfairft"
 echo "============================================"
-echo "Fine-tuning PFairFT-CE (v2: 5 heads)..."
+echo "Fine-tuning PFairFT (v2: 5 heads)..."
 python "${PROJECT_ROOT}/5_finetuning/finetune_precision_fairness.py" \
     --model_path "${MODEL_PATH}" \
     --dataset_json_path "${JSON_PATH}" \
     --heads_analysis_dir "${HEADS_DIR}" \
-    --output_dir "${PFAIRFT_KL_CE_DIR}" \
+    --output_dir "${PFAIRFT_DIR}" \
     --sample_csv_path "${CSV_PATH}" \
     --sample_size 1000 \
     --lora_rank 8 --lora_alpha 16 --lora_dropout 0.1 \
     --num_epochs 3 --batch_size 1 --gradient_accumulation_steps 8 \
     --learning_rate 2e-5 --loss_type fairness_ce --fairness_lambda 0.1 --seed 42
 
-echo "Evaluating PFairFT-CE Resume DP..."
+echo "Evaluating PFairFT Resume DP..."
 python "${PROJECT_ROOT}/6_downstream_evaluation/evaluate_resume_fairness_top100.py" \
-    --mode pfairft_ce \
+    --mode pfairft \
     --base_model_path "${MODEL_PATH}" \
-    --adapter_path "${PFAIRFT_KL_CE_DIR}/final_model" \
+    --adapter_path "${PFAIRFT_DIR}/final_model" \
     --biased_csv_path "${CSV_PATH}" \
-    --output_csv_path "${EVAL_DIR}/resume_pfairft_ce.csv" \
+    --output_csv_path "${EVAL_DIR}/resume_pfairft.csv" \
     --device "cuda" --model_type "qwen"
 
-echo "Evaluating PFairFT-CE MMLU LM-CE..."
+echo "Evaluating PFairFT MMLU LM-CE..."
 python "${PROJECT_ROOT}/6_downstream_evaluation/evaluate_mmlu_ce.py" \
     --model_path "${MODEL_PATH}" \
-    --adapter_path "${PFAIRFT_KL_CE_DIR}/final_model" \
-    --out_json "${EVAL_DIR}/mmlu_ce_pfairft_ce.json"
+    --adapter_path "${PFAIRFT_DIR}/final_model" \
+    --out_json "${EVAL_DIR}/mmlu_ce_pfairft.json"
 
-echo "Evaluating PFairFT-CE Discrim-Eval..."
+echo "Evaluating PFairFT Discrim-Eval..."
 python "${PROJECT_ROOT}/6_downstream_evaluation/evaluate_models_discrim.py" \
-    --mode pfairft_ce \
+    --mode pfairft \
     --base_model_path "${MODEL_PATH}" \
-    --adapter_path "${PFAIRFT_KL_CE_DIR}/final_model" \
-    --csv_path "${EVAL_DIR}/discrim_pfairft_ce.csv" \
+    --adapter_path "${PFAIRFT_DIR}/final_model" \
+    --csv_path "${EVAL_DIR}/discrim_pfairft.csv" \
     --device "cuda" --model_type "qwen"
 
 # ================================================================
@@ -249,7 +249,6 @@ python "${PROJECT_ROOT}/6_downstream_evaluation/plot_figure8.py" \
     --pfairft_csv "${EVAL_DIR}/discrim_pfairft.csv" \
     --pfairft_kl_csv "${EVAL_DIR}/discrim_pfairft_kl.csv" \
     --global_csv "${EVAL_DIR}/discrim_global.csv" \
-    --pfairft_ce_csv "${EVAL_DIR}/discrim_pfairft_ce.csv" \
     --out_pdf "${EVAL_DIR}/Figure8_Qwen_MoE_with_KLCE.pdf" \
     --model_label "Qwen1.5-MoE 2.7B"
 

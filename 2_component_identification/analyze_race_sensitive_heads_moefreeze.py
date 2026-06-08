@@ -30,7 +30,7 @@ from util import (
     compute_elbow_point, compute_rank_array
 )
 from sampling import sample_resume_data_by_race
-from prompt import build_category_prompt, format_prompt_for_model, resolve_model_type
+from prompt import build_resume_prompt, format_prompt_for_model, resolve_model_type
 from probability import get_target_token_ids, YES_CANDIDATES, NO_CANDIDATES, log_top3_warning
 from hook import (
     get_last_token_indices_safe,
@@ -38,6 +38,11 @@ from hook import (
     create_config_detection_hook
 )
 from util import get_model_config
+from model_adapter import (
+    get_model_adapter,
+    make_router_cache_hook,
+    make_router_force_hook,
+)
 from cache import DiskActivationCache
 from plot import plot_kl_heatmap, plot_elbow_point_vs_rank, plot_rank_heatmap
 from prompt import add_yes_no_instruction
@@ -45,6 +50,24 @@ from prompt import add_yes_no_instruction
 
 moe_routing_cache = {}
 current_batch_indices = []
+
+YES_NO_FINAL_REQUIREMENT = "FINAL REQUIREMENT: Respond with the single word 'Yes' or 'No' only."
+
+
+def ensure_yes_no_instruction(prompt: str) -> str:
+    if YES_NO_FINAL_REQUIREMENT in prompt:
+        return prompt
+    return add_yes_no_instruction(prompt)
+
+
+def _normalize_resume_race_label(race: str) -> str:
+    race_lower = str(race).lower()
+    if "white" in race_lower or "caucasian" in race_lower:
+        return "White"
+    if "black" in race_lower or "african" in race_lower:
+        return "Black"
+    return "Unknown"
+
 
 def get_moe_save_hook(layer_idx):
     def hook(module, args, output):
@@ -98,8 +121,8 @@ class InterventionDataset(Dataset):
         
         return {
             "index": idx,
-            "fact_prompt": add_yes_no_instruction(fact["query"]),
-            "cf_prompt": add_yes_no_instruction(cf["query"]),
+            "fact_prompt": ensure_yes_no_instruction(fact["query"]),
+            "cf_prompt": ensure_yes_no_instruction(cf["query"]),
             "race": race if race else "Unknown"
         }
 
@@ -166,7 +189,7 @@ def main():
         "--model_type",
         type=str,
         default="auto",
-        choices=["auto", "llama", "qwen", "deepseek"],
+        choices=["auto", "llama", "qwen", "deepseek", "olmoe", "jetmoe"],
         help="Model architecture for prompt formatting. Use 'auto' to infer from model/tokenizer.",
     )
     parser.add_argument("--random_sampling", action="store_true", default=False,
@@ -199,6 +222,13 @@ def main():
         action="store_false",
         help="Disable balanced sampling (use --no-balanced to disable)."
     )
+    parser.add_argument(
+        "--resume_prompt_mode",
+        type=str,
+        default="summary_only",
+        choices=["summary_only", "category", "no_job_description"],
+        help="Resume prompt body before the strict Yes/No instruction.",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -221,8 +251,11 @@ def main():
         )
         model.eval()
 
+        adapter = get_model_adapter(model, model_type=args.model_type, model_path=args.model_path)
+        print(f"Using architecture adapter: {adapter.family} ({adapter.head_activation_kind})")
+
         # 获取模型配置
-        config = get_model_config(model)
+        config = adapter.get_config()
         num_layers = config["num_layers"]
         num_heads = config["num_heads"]
         head_dim = config["head_dim"]
@@ -279,39 +312,51 @@ def main():
         if args.sample_csv_path:
             print(f"  - White: {white_count}, Black: {black_count} (CSV-driven sampling)")
         
-        # 准备 fact 数据：从 summary 构建 query
         fact_data = []
+        cf_data = []
+        # 准备 fact 数据：显式使用与 ranking / downstream / training 相同的 resume prompt mode。
+        fact_base_data = []
         for item in sampled_data:
             summary = item.get("summary", "")
             category = item.get("category", "")
             race = item.get("race", "")
-        
-            
-            fact_item = {
-                "query": summary,
+            base_query = build_resume_prompt(
+                summary=summary,
+                category=category,
+                mode=args.resume_prompt_mode,
+            )
+
+            fact_base_item = {
+                "query": base_query,
                 "summary": summary,
                 "category": category,
                 "race": race,
                 "ID": item.get("ID", 0),
             }
-            fact_data.append(fact_item)
-        
-        # 创建反事实数据
+            fact_base_data.append(fact_base_item)
+
         print("Creating counterfactual data (flipping race)...")
-        cf_data = []
-        for fact_item in fact_data:
-            cf_item = create_counterfactual_by_race(fact_item)
+        for fact_base_item in fact_base_data:
+            cf_base_item = create_counterfactual_by_race(fact_base_item)
+
+            fact_item = dict(fact_base_item)
+            fact_item["query"] = add_yes_no_instruction(fact_base_item["query"])
+
+            cf_item = dict(cf_base_item)
+            cf_item["query"] = add_yes_no_instruction(cf_base_item["query"])
+
+            fact_data.append(fact_item)
             cf_data.append(cf_item)
         
         min_len = min(len(fact_data), len(cf_data))
         fact_data = fact_data[:min_len]
         cf_data = cf_data[:min_len]
 
-        # 种族列表（与样本顺序一一对应）
-        races_list = []
+        # 种族列表（与样本顺序一一对应）。
+        fact_races_list = []
         for item in fact_data:
-            r = extract_race_from_query(item["query"])
-            races_list.append(r if r else "Unknown")
+            r = item.get("race") or extract_race_from_query(item["query"])
+            fact_races_list.append(_normalize_resume_race_label(r) if r else "Unknown")
 
         # 先检测实际的模型配置（通过运行一个样本）
         print("Detecting actual model configuration from model...")
@@ -319,7 +364,7 @@ def main():
         
         # 注册临时 hook 检测
         detect_hook_fn = create_config_detection_hook(temp_buffer)
-        temp_hook = model.model.layers[0].self_attn.o_proj.register_forward_hook(detect_hook_fn)
+        temp_hook = adapter.register_config_detection_hook(temp_buffer)
         # 运行一个样本
         if len(fact_data) > 0:
             test_prompt = format_prompt_for_model(fact_data[0]["query"], model_type)
@@ -374,20 +419,8 @@ def main():
 
         # 注册 Hooks（仅用于 CF 跑）
         hooks = []
-        moe_hooks_fact = []
         for l in range(num_layers):
-            if hasattr(model.model.layers[l], "mlp") and hasattr(model.model.layers[l].mlp, "gate"):
-                moe_hooks_fact.append(model.model.layers[l].mlp.gate.register_forward_hook(get_moe_save_hook(l)))
-                
-        for l in range(num_layers):
-            if hasattr(model.model.layers[l].self_attn, "o_proj"):
-                layer_module = model.model.layers[l].self_attn.o_proj
-            else:
-                raise ValueError("Cannot find o_proj")
-            hook_fn = get_activation_hook_for_intervention(
-                l, num_heads, head_dim, batch_activations_buffer
-            )
-            hooks.append(layer_module.register_forward_hook(hook_fn))
+            hooks.append(adapter.register_head_activation_hook(l, num_heads, head_dim, batch_activations_buffer))
 
         # 1) 先跑 CF，收集所有层的 head 激活
         for batch in tqdm(dataloader, desc="Collecting CF Activations"):
@@ -425,19 +458,17 @@ def main():
         print("Collecting Fact probabilities and activations...")
         hooks_fact = []
         moe_hooks_fact = []
-        for l in range(num_layers):
-            if hasattr(model.model.layers[l], "mlp") and hasattr(model.model.layers[l].mlp, "gate"):
-                moe_hooks_fact.append(model.model.layers[l].mlp.gate.register_forward_hook(get_moe_save_hook(l)))
+        router_modules = adapter.router_modules_for_freeze()
+        print(f"Registering {len(router_modules)} router cache hooks for MoE freeze.")
+        for router_key, router_module in router_modules:
+            moe_hooks_fact.append(
+                router_module.register_forward_hook(
+                    make_router_cache_hook(router_key, moe_routing_cache, lambda: current_batch_indices)
+                )
+            )
                 
         for l in range(num_layers):
-            if hasattr(model.model.layers[l].self_attn, "o_proj"):
-                layer_module = model.model.layers[l].self_attn.o_proj
-            else:
-                raise ValueError("Cannot find o_proj")
-            hook_fn = get_activation_hook_for_intervention(
-                l, num_heads, head_dim, batch_activations_buffer
-            )
-            hooks_fact.append(layer_module.register_forward_hook(hook_fn))
+            hooks_fact.append(adapter.register_head_activation_hook(l, num_heads, head_dim, batch_activations_buffer))
         
         for batch in tqdm(dataloader, desc="Fact Inference"):
             indices = batch["index"]
@@ -503,9 +534,9 @@ def main():
         # Step 2: 按种族计算每个头的激活值均值
         # ==========================================
         print("Step 2: Computing race-specific mean activations per head...")
-        white_indices = [i for i, r in enumerate(races_list) if r == "White"]
-        black_indices = [i for i, r in enumerate(races_list) if r == "Black"]
-        print(f"White: {len(white_indices)}, Black: {len(black_indices)}")
+        fact_white_indices = [i for i, r in enumerate(fact_races_list) if r == "White"]
+        fact_black_indices = [i for i, r in enumerate(fact_races_list) if r == "Black"]
+        print(f"White: {len(fact_white_indices)}, Black: {len(fact_black_indices)}")
 
         # 为每个 (layer, head) 计算 White/Black 的激活值均值与标准差
         white_head_means = {}
@@ -517,20 +548,23 @@ def main():
         for l in range(num_layers):
             for h in range(num_heads):
                 # 获取该头所有样本的激活值: [N, Head_Dim]
-                head_activations = fact_activations_cache.get_column(l, h)
+                fact_head_activations = fact_activations_cache.get_column(l, h)
+                white_activations = fact_head_activations[fact_white_indices] if fact_white_indices else None
+                black_activations = fact_head_activations[fact_black_indices] if fact_black_indices else None
+                head_activations = fact_head_activations
                 
                 # 计算 White 均值
-                if white_indices:
-                    white_head_means[(l, h)] = np.mean(head_activations[white_indices], axis=0)
-                    white_stds[(l, h)] = np.std(head_activations[white_indices], axis=0) if len(white_indices) > 1 else np.ones(head_dim, dtype=np.float32)
+                if white_activations is not None and len(white_activations) > 0:
+                    white_head_means[(l, h)] = np.mean(white_activations, axis=0)
+                    white_stds[(l, h)] = np.std(white_activations, axis=0) if len(white_activations) > 1 else np.ones(head_dim, dtype=np.float32)
                 else:
                     white_head_means[(l, h)] = np.zeros(head_dim, dtype=np.float32)
                     white_stds[(l, h)] = np.ones(head_dim, dtype=np.float32)
                 
                 # 计算 Black 均值
-                if black_indices:
-                    black_head_means[(l, h)] = np.mean(head_activations[black_indices], axis=0)
-                    black_stds[(l, h)] = np.std(head_activations[black_indices], axis=0) if len(black_indices) > 1 else np.ones(head_dim, dtype=np.float32)
+                if black_activations is not None and len(black_activations) > 0:
+                    black_head_means[(l, h)] = np.mean(black_activations, axis=0)
+                    black_stds[(l, h)] = np.std(black_activations, axis=0) if len(black_activations) > 1 else np.ones(head_dim, dtype=np.float32)
                 else:
                     black_head_means[(l, h)] = np.zeros(head_dim, dtype=np.float32)
                     black_stds[(l, h)] = np.ones(head_dim, dtype=np.float32)
@@ -556,9 +590,13 @@ def main():
 
         print("Registering MoE Routing Freeze Hooks...")
         moe_force_hooks = []
-        for l in range(num_layers):
-            if hasattr(model.model.layers[l], "mlp") and hasattr(model.model.layers[l].mlp, "gate"):
-                moe_force_hooks.append(model.model.layers[l].mlp.gate.register_forward_hook(get_moe_force_hook(l)))
+        router_modules = adapter.router_modules_for_freeze()
+        for router_key, router_module in router_modules:
+            moe_force_hooks.append(
+                router_module.register_forward_hook(
+                    make_router_force_hook(router_key, moe_routing_cache, lambda: current_batch_indices)
+                )
+            )
 
         # DEBUG: 标记是否已输出首次干预的调试信息
         first_intervention_printed = False
@@ -566,8 +604,6 @@ def main():
         # 外层循环：层
         for l in range(num_layers):
             print(f"Processing Layer {l}/{num_layers - 1}...")
-
-            target_module = model.model.layers[l].self_attn.o_proj
 
             layer_head_kl_sum = torch.zeros(num_heads, dtype=torch.float64, device="cpu")
             total_samples = 0
@@ -593,7 +629,11 @@ def main():
                 # 当前层 CF 激活: [B, H, D]
                 cf_layer_data = cf_activations_cache.get_batch_layer(indices, l)
                 
-                target_device = next(target_module.parameters()).device
+                target_module = adapter.get_head_activation_module(l)
+                try:
+                    target_device = next(target_module.parameters()).device
+                except StopIteration:
+                    target_device = next(model.parameters()).device
                 fact_layer_tensor = torch.from_numpy(fact_layer_data).to(target_device)
                 cf_layer_tensor = torch.from_numpy(cf_layer_data).to(target_device)
 
@@ -615,11 +655,10 @@ def main():
                         print(f"  Intervention logic: Set all heads to fact activations, then set head {h} to counterfactual activation")
                         print("=" * 80)
                         first_intervention_printed = True
-                    hook_fn = get_patch_hook_modified(
-                        h, fact_layer_tensor, cf_layer_tensor, last_token_indices,
+                    hook_handle = adapter.register_head_patch_hook(
+                        l, h, fact_layer_tensor, cf_layer_tensor, last_token_indices,
                         num_heads, head_dim
                     )
-                    hook_handle = target_module.register_forward_pre_hook(hook_fn)
 
                     try:
                         with torch.no_grad():
@@ -701,6 +740,18 @@ def main():
             "rank_array": rank_array,
             "intervention_method": "modified_total_effect",
             "intervention_description": "Set all heads to fact activations, then set selected head to counterfactual activation",
+            "metadata": {
+                "model_path": args.model_path,
+                "model_type": model_type,
+                "dataset_json_path": args.dataset_json_path,
+                "sample_csv_path": args.sample_csv_path,
+                "sample_size": args.sample_size,
+                "resume_prompt_mode": args.resume_prompt_mode,
+                "dataset_kind": "resume",
+                "num_samples": min_len,
+                "first_fact_prompt": fact_data[0]["query"] if fact_data else "",
+                "first_cf_prompt": cf_data[0]["query"] if cf_data else "",
+            },
         }
         
         with open(os.path.join(args.output_dir, "results.pkl"), "wb") as f:
@@ -708,6 +759,9 @@ def main():
 
         with open(os.path.join(args.output_dir, "selected_heads_elbow.json"), "w", encoding="utf-8") as f:
             json.dump(selected, f, indent=2)
+
+        with open(os.path.join(args.output_dir, "metadata.json"), "w", encoding="utf-8") as f:
+            json.dump(results_data["metadata"], f, indent=2, ensure_ascii=False)
         
         # 绘制肘点与排名图
         plot_elbow_point_vs_rank(
@@ -735,8 +789,8 @@ def main():
         print("="*60)
         print(f"Model: {args.model_path}")
         print(f"Total Samples: {min_len}")
-        print(f"  - White: {len(white_indices)}")
-        print(f"  - Black: {len(black_indices)}")
+        print(f"  - White: {len(fact_white_indices)}")
+        print(f"  - Black: {len(fact_black_indices)}")
         print(f"\nModel Architecture:")
         print(f"  - Layers: {num_layers}")
         print(f"  - Heads per Layer: {num_heads}")

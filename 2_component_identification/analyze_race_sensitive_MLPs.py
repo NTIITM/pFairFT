@@ -105,7 +105,7 @@ def main():
         "--model_type",
         type=str,
         default="auto",
-        choices=["auto", "llama", "qwen", "deepseek"],
+        choices=["auto", "llama", "qwen", "deepseek", "olmoe", "jetmoe"],
         help="Model architecture for prompt formatting. Use 'auto' to infer from model/tokenizer.",
     )
     parser.add_argument(
@@ -549,4 +549,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
