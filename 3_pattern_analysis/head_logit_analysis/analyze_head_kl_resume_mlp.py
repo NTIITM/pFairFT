@@ -128,9 +128,10 @@ def make_mlp_input_to_output_replacement_hook(layer_idx: int, output_pos):
     """Same as exp15/evaluate_intervention_MLP_resume.py."""
 
     def hook(module, inputs, output):
-        if not isinstance(output, torch.Tensor):
+        hidden = output[0] if isinstance(output, tuple) else output
+        if not isinstance(hidden, torch.Tensor):
             raise ValueError(
-                f"MLP hook at layer {layer_idx}: expected Tensor output, got {type(output)}"
+                f"MLP hook at layer {layer_idx}: expected Tensor output, got {type(hidden)}"
             )
         if not inputs or not isinstance(inputs[0], torch.Tensor):
             raise ValueError(
@@ -138,7 +139,7 @@ def make_mlp_input_to_output_replacement_hook(layer_idx: int, output_pos):
             )
 
         inp = inputs[0]
-        out = output.clone()
+        out = hidden.clone()
 
         if inp.ndim != 3 or out.ndim != 3:
             raise ValueError(
@@ -155,6 +156,8 @@ def make_mlp_input_to_output_replacement_hook(layer_idx: int, output_pos):
         elif int(output_pos) < out.shape[1]:
             inp_vec = inp[:, int(output_pos), :].to(dtype=out.dtype, device=out.device)
             out[:, int(output_pos), :] = inp_vec
+        if isinstance(output, tuple):
+            return (out,) + output[1:]
         return out
 
     return hook
