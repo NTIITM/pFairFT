@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""EXP23: Plot head metric comparing two adapters on a QID subset.
+"""Plot adapter head-level fairness gaps on a QID subset.
 
-Plotting rule (per user request, following exp21/plot_head_expression_exp21.py style):
+Plotting rule:
 - Read `sensitive_heads_json`.
 - Non-sensitive heads: white small circles.
 - Sensitive heads:

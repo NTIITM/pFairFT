@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""EXP23: Head-level fairness violation comparison on QID.
+"""Compare adapter head-level fairness gaps on a Discrim-Eval QID.
 
 We compute per-head metric: mean |Δp_yes| between factual/counterfactual paired samples.
 Compare two adapters on a base model. Dense models use o_proj-input head

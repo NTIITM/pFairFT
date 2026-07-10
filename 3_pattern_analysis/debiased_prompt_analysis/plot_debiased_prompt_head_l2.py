@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+"""Plot head activation L2 norms before and after debiased prompting."""
 
 import argparse
 import json
@@ -110,17 +111,33 @@ def _plot_three(expr_prompt: np.ndarray, expr_deb: np.ndarray, selected: Set[Tup
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--exp21_model_dir", type=str, required=True)
+    p.add_argument(
+        "--analysis_dir",
+        type=str,
+        default="",
+        help="Directory containing expr_l2_prompt.npy and expr_l2_debiased.npy.",
+    )
+    p.add_argument(
+        "--exp21_model_dir",
+        type=str,
+        default="",
+        help="Deprecated alias for --analysis_dir.",
+    )
     p.add_argument(
         "--selected_heads_json",
         type=str,
-        default="/home/common1/hwluo/project/pFairFT/exp2_old/sensitive_heads_Qwen3-4B_top100/selected_heads_elbow.json",
+        required=True,
+        help="Path to selected_heads_elbow.json from the matching head-selection run.",
     )
     p.add_argument("--out_path", type=str, required=True)
     args = p.parse_args()
 
-    expr_prompt = np.load(os.path.join(args.exp21_model_dir, "expr_l2_prompt.npy"))
-    expr_deb = np.load(os.path.join(args.exp21_model_dir, "expr_l2_debiased.npy"))
+    analysis_dir = args.analysis_dir or args.exp21_model_dir
+    if not analysis_dir:
+        raise ValueError("Provide --analysis_dir (or deprecated --exp21_model_dir).")
+
+    expr_prompt = np.load(os.path.join(analysis_dir, "expr_l2_prompt.npy"))
+    expr_deb = np.load(os.path.join(analysis_dir, "expr_l2_debiased.npy"))
 
     selected = _load_selected_heads(args.selected_heads_json)
 

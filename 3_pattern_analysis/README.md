@@ -19,11 +19,17 @@ Analyze MLP input/output similarity and their contribution to biased output.
 ### `debiased_prompt_analysis/` (exp21)
 Study head behavior under debiased prompts — why debiasing sometimes fails.
 
+- `plot_debiased_prompt_head_l2.py`: plot head activation L2 norms before and after debiased prompting, highlighting selected sensitive heads.
+
 ### `model_comparison/` (exp23)
 Compare head activation patterns between fine-tuned and baseline models.
 
+- `compare_adapter_head_fairness_gap.py`: compute per-head mean absolute factual-vs-counterfactual p(yes) gaps for two adapters on one Discrim-Eval QID.
+- `plot_adapter_head_fairness_gap.py`: plot those adapter head-level gap matrices with sensitive heads highlighted.
+
 ## Usage
 ```bash
-bash scripts/run_exp20.sh  # KL analysis across all layers
-bash scripts/run_exp21.sh  # Debiased prompt analysis
+python 3_pattern_analysis/model_comparison/compare_adapter_head_fairness_gap.py --help
+python 3_pattern_analysis/model_comparison/plot_adapter_head_fairness_gap.py --help
+python 3_pattern_analysis/debiased_prompt_analysis/plot_debiased_prompt_head_l2.py --help
 ```
