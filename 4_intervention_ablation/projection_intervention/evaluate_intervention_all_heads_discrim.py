@@ -75,6 +75,7 @@ def main():
     parser.add_argument("--model_type", type=str, default="auto")
     parser.add_argument("--output_dir", type=str, default="exp25_results")
     parser.add_argument("--csv_path", type=str, default="")
+    parser.add_argument("--append_csv", action="store_true")
     parser.add_argument("--sensitive_heads_dir", type=str, default="")
     parser.add_argument("--intervention_mode", type=str, choices=["all", "partial"], default="all")
     parser.add_argument("--intervention_strength", type=float, default=1.0)
@@ -160,14 +161,37 @@ def main():
         finally: remove_intervention_hooks(hooks)
 
     if args.csv_path:
-        file_exists = os.path.exists(args.csv_path)
         m_name = os.path.basename(os.path.normpath(args.model_path))
         matched_map = {a: b for a, b in pairs}; matched_map.update({b: a for a, b in pairs})
-        with open(args.csv_path, "a", newline="") as f:
+        mode = "a" if args.append_csv else "w"
+        write_header = not args.append_csv or not os.path.exists(args.csv_path)
+        with open(args.csv_path, mode, newline="") as f:
             writer = csv.writer(f)
-            if not file_exists: writer.writerow(["sample_id", "matched_id", "model", "decision_question_id", "p_yes", "intervention_type"])
+            if write_header: writer.writerow(["sample_id", "matched_id", "model", "decision_question_id", "p_yes", "intervention_type"])
             for s, p in zip(data, p_yes_results):
                 writer.writerow([s["id"], matched_map.get(int(s["id"]), ""), m_name, s.get("decision_question_id", ""), p, f"debias_{args.intervention_mode}"])
+
+    p_yes_map = {int(sample["id"]): p for sample, p in zip(data, p_yes_results)}
+    stats = compute_stats_by_question(pairs, id_to_sample, p_yes_map)
+    metadata = {
+        "dataset": "discrim_eval_transfer",
+        "dataset_path": args.dataset_path,
+        "model_path": args.model_path,
+        "model_type": model_type,
+        "adapter_family": adapter.family,
+        "head_activation_kind": adapter.head_activation_kind,
+        "sensitive_heads_dir": args.sensitive_heads_dir,
+        "intervention_mode": args.intervention_mode,
+        "intervention_strength": args.intervention_strength,
+        "num_target_heads": len(target_heads),
+        "num_samples": len(data),
+        "num_pairs": len(pairs),
+        "seed": args.seed,
+        "csv_path": args.csv_path or None,
+        "stats_by_question": {str(key): value for key, value in stats.items()},
+    }
+    with open(os.path.join(args.output_dir, "discrim_metadata.json"), "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
 
 if __name__ == "__main__":
     main()

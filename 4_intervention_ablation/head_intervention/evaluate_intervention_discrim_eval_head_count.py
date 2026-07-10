@@ -15,6 +15,7 @@ UNDER NEGATIVE / RANDOM NEGATIVE HEAD-LEVEL INTERVENTION, with varying head coun
 
 import argparse
 import csv
+import json
 import math
 import os
 import pickle
@@ -35,7 +36,6 @@ from probability import (
     YES_CANDIDATES,
     NO_CANDIDATES,
     get_target_token_ids,
-    compute_p_yes_batch, # For baseline (head_count=0)
 )
 from prompt import (
     add_yes_no_instruction,
@@ -120,6 +120,88 @@ def compute_p_yes_with_intervention(
         remove_intervention_hooks(prompt_hooks)
 
     return 0.0
+
+
+def compute_p_yes_batch_with_intervention(
+    model,
+    adapter,
+    tokenizer,
+    prompts: List[str],
+    model_type: str,
+    heads_for_intervention: List[Tuple[int, int]],
+    white_emb: Dict[Tuple[int, int], np.ndarray],
+    black_emb: Dict[Tuple[int, int], np.ndarray],
+    input_device: torch.device,
+    yes_ids: List[int],
+    no_ids: List[int],
+    num_heads: int,
+    head_dim: int,
+    batch_size: int,
+) -> List[float]:
+    """Compute intervened p(yes) in batches with per-sample token positions."""
+    results: List[float] = []
+    for start in tqdm(
+        range(0, len(prompts), batch_size),
+        desc=f"Computing p(yes) with {len(heads_for_intervention)} heads",
+    ):
+        batch_prompts = [
+            format_prompt_for_model(prompt, model_type)
+            for prompt in prompts[start : start + batch_size]
+        ]
+        inputs = tokenizer(
+            batch_prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            add_special_tokens=False,
+        ).to(input_device)
+        attention_mask = inputs.get(
+            "attention_mask", torch.ones_like(inputs["input_ids"])
+        )
+        positions = get_last_token_indices_safe(
+            inputs["input_ids"], attention_mask, tokenizer
+        )
+        hooks = []
+        for layer, head in heads_for_intervention:
+            if (layer, head) not in white_emb or (layer, head) not in black_emb:
+                continue
+            mean = torch.from_numpy(
+                (white_emb[(layer, head)] + black_emb[(layer, head)]) / 2.0
+            ).float()
+            hooks.append(
+                adapter.register_head_mean_replacement_hook(
+                    layer,
+                    head,
+                    mean,
+                    positions,
+                    num_heads,
+                    head_dim,
+                )
+            )
+        try:
+            with torch.no_grad():
+                outputs = model(**inputs)
+        finally:
+            remove_intervention_hooks(hooks)
+        rows = torch.arange(len(batch_prompts), device=outputs.logits.device)
+        logits = outputs.logits[
+            rows, positions.to(outputs.logits.device), :
+        ].float()
+        for offset, logits_row in enumerate(logits):
+            results.append(
+                float(
+                    compute_p_yes_from_logits_with_warning(
+                        logits_row=logits_row,
+                        tokenizer=tokenizer,
+                        yes_ids=yes_ids,
+                        no_ids=no_ids,
+                        sample_idx=start + offset,
+                        show_warnings=False,
+                        prefix="Intervention-negative-batch",
+                    )
+                )
+            )
+    return results
 
 
 def compute_stats_by_question(
@@ -250,6 +332,15 @@ def main():
     )
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for reproducible head sampling.")
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=1,
+        help=(
+            "Forward batch size. Keep 1 for MOE paper results because routed "
+            "models can be batch-composition dependent."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -290,6 +381,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
     model.eval()
 
     input_device = get_input_device(model, args.device)
@@ -441,39 +533,39 @@ def main():
         # 1. 计算所有样本的 p(yes) （在当前干预头数量和模式下）
         p_yes_results_intervened: List[float] = []
         if head_count == 0:
-            # Baseline: 无干预，使用批量计算
-            p_yes_results_intervened = compute_p_yes_batch(
+            p_yes_results_intervened = compute_p_yes_batch_with_intervention(
                 model=model,
+                adapter=adapter,
                 tokenizer=tokenizer,
                 prompts=prompts,
-                device=str(input_device),
+                model_type=model_type,
+                heads_for_intervention=[],
+                white_emb=white_emb,
+                black_emb=black_emb,
+                input_device=input_device,
                 yes_ids=yes_ids,
                 no_ids=no_ids,
-                model_type=model_type,
-                desc=f"Computing baseline p(yes)",
-                show_warnings=False,
+                num_heads=num_heads,
+                head_dim=head_dim,
+                batch_size=args.batch_size,
             )
         else:
-            for idx, prompt in enumerate(tqdm(
-                prompts,
-                desc=f"Computing p(yes) with {len(current_heads)} heads"
-            )):
-                p_yes = compute_p_yes_with_intervention(
-                    model=model,
-                    adapter=adapter,
-                    tokenizer=tokenizer,
-                    prompt=prompt,
-                    model_type=model_type,
-                    heads_for_intervention=current_heads,
-                    white_emb=white_emb,
-                    black_emb=black_emb,
-                    input_device=input_device,
-                    yes_ids=yes_ids,
-                    no_ids=no_ids,
-                    num_heads=num_heads,
-                    head_dim=head_dim,
-                )
-                p_yes_results_intervened.append(p_yes)
+            p_yes_results_intervened = compute_p_yes_batch_with_intervention(
+                model=model,
+                adapter=adapter,
+                tokenizer=tokenizer,
+                prompts=prompts,
+                model_type=model_type,
+                heads_for_intervention=current_heads,
+                white_emb=white_emb,
+                black_emb=black_emb,
+                input_device=input_device,
+                yes_ids=yes_ids,
+                no_ids=no_ids,
+                num_heads=num_heads,
+                head_dim=head_dim,
+                batch_size=args.batch_size,
+            )
 
         # 2. Map results by sample_id
         p_yes_map = {int(sample["id"]): p_yes for sample, p_yes in zip(data, p_yes_results_intervened)}
@@ -506,6 +598,10 @@ def main():
         "seed": args.seed,
         "rows": len(data),
         "pairs": len(pairs),
+        "batch_size": args.batch_size,
+        "routing_batch_note": (
+            "MOE paper results require batch_size=1 to avoid batch-composition-dependent routing."
+        ),
     }
     with open(os.path.join(args.output_dir, "metadata.json"), "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
