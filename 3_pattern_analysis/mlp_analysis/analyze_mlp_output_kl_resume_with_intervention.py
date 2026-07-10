@@ -34,8 +34,9 @@ from sampling import load_samples_by_csv_indices
 from hook import (
     get_last_token_indices_safe,
     remove_intervention_hooks,
-    make_intervention_hook_mean_replacement,
 )
+from model_adapter import get_model_adapter
+from residual_probe import collect_next_mlp_inputs
 
 
 class ResumeDataset(Dataset):
@@ -80,105 +81,17 @@ def _kl_pq(p: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
     return torch.sum(p * (torch.log(p) - torch.log(q)), dim=-1)
 
 
-def _collect_mlp_outputs_intervened(
-    model,
-    tokenizer,
-    model_type: str,
-    device: torch.device,
-    dataloader: DataLoader,
-    num_layers: int,
-    sensitive_heads: List[Tuple[int, int]],
-    head_mean_emb: Dict[Tuple[int, int], torch.Tensor],
-    num_heads: int,
-    head_dim: int,
-    prompt_key: str,
-) -> Dict[int, np.ndarray]:
-    """Collect last-token *next-layer module inputs* under attention head intervention.
-
-    For layer l (0 <= l < num_layers-1): collect the input to layer (l+1).mlp.
-    For the last layer (l == num_layers-1): collect the input to final norm.
-    """
-
-    layer_to_chunks: Dict[int, List[np.ndarray]] = {l: [] for l in range(num_layers)}
-
-    def make_input_hook():
-        def hook(module, inputs):
-            if not inputs:
-                return
-            x = inputs[0]
-            if not isinstance(x, torch.Tensor):
-                return
-            module._last_input = x
-        return hook
-
-    collect_hpairs = []
-
-    for l in range(num_layers - 1):
-        mlp_next = model.model.layers[l + 1].mlp
-        h = mlp_next.register_forward_pre_hook(make_input_hook())
-        collect_hpairs.append((l, mlp_next, h))
-
-    final_norm = model.model.norm
-    h_norm = final_norm.register_forward_pre_hook(make_input_hook())
-    collect_hpairs.append((num_layers - 1, final_norm, h_norm))
-
-    with torch.no_grad():
-        for batch in tqdm(dataloader, desc=f"Collect Intervened next-module inputs ({prompt_key})"):
-            prompts = [format_prompt_for_model(p, model_type) for p in batch[prompt_key]]
-            inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, add_special_tokens=False)
-
-            embed_device = model.model.embed_tokens.weight.device
-            for k, v in list(inputs.items()):
-                if isinstance(v, torch.Tensor):
-                    inputs[k] = v.to(embed_device)
-
-            attention_mask = inputs.get("attention_mask", torch.ones_like(inputs["input_ids"]))
-            last_token_indices = get_last_token_indices_safe(inputs["input_ids"], attention_mask, tokenizer)
-            output_pos = last_token_indices
-            batch_range = torch.arange(inputs["input_ids"].shape[0], device=embed_device)
-
-            intervention_hooks = []
-            for l, h_idx in sensitive_heads:
-                mean_emb = head_mean_emb.get((l, h_idx))
-                if mean_emb is None:
-                    continue
-                target_module = model.model.layers[l].self_attn.o_proj
-                hook_fn = make_intervention_hook_mean_replacement(
-                    l,
-                    h_idx,
-                    mean_emb,
-                    output_pos,
-                    num_heads,
-                    head_dim,
-                )
-                hook = target_module.register_forward_pre_hook(hook_fn)
-                intervention_hooks.append(hook)
-
-            _ = model(**inputs)
-            remove_intervention_hooks(intervention_hooks)
-
-            for l, mod, _ in collect_hpairs:
-                if not hasattr(mod, "_last_input"):
-                    continue
-                x = mod._last_input
-                if not isinstance(x, torch.Tensor):
-                    continue
-                last_x = x[batch_range.to(x.device), last_token_indices.to(x.device), :]
-                layer_to_chunks[l].append(last_x.detach().cpu().float().numpy())
-                del mod._last_input
-
-    for _, _, h in collect_hpairs:
-        h.remove()
-
-    return {l: np.concatenate(chunks, axis=0) for l, chunks in layer_to_chunks.items() if chunks}
-
-
 import pickle
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", type=str, required=True)
+    parser.add_argument(
+        "--dataset_json_path",
+        type=str,
+        default="/home/common1/hwluo/project/pFairFT/data/resume/qwen_summaries_with_race.json",
+    )
     parser.add_argument("--biased_csv_path", type=str, required=True)
     parser.add_argument("--sensitive_heads_path", type=str, required=True)
     parser.add_argument("--embeddings_path", type=str, required=True)
@@ -202,6 +115,8 @@ def main() -> None:
     head_dim = config["head_dim"]
     model_type = resolve_model_type(args.model_type, model=model, tokenizer=tokenizer, model_path=args.model_path)
     device = torch.device(args.device)
+    adapter = get_model_adapter(model, model_type=args.model_type, model_path=args.model_path)
+    print(f"Using adapter: {adapter.family} ({adapter.head_activation_kind})")
 
     yes_ids = get_target_token_ids(tokenizer, YES_CANDIDATES)
     no_ids = get_target_token_ids(tokenizer, NO_CANDIDATES)
@@ -249,7 +164,9 @@ def main() -> None:
 
     sensitive_heads = valid_sensitive_heads
 
-    sampled_data = _load_resume_topk_by_csv("/home/common1/hwluo/project/pFairFT/data/resume/qwen_summaries_with_race.json", args.biased_csv_path, args.sample_size)
+    sampled_data = _load_resume_topk_by_csv(
+        args.dataset_json_path, args.biased_csv_path, args.sample_size
+    )
     fact_data, cf_data = [], []
     for item in sampled_data:
         base_query = build_category_prompt(item["summary"], item["category"])
@@ -260,17 +177,44 @@ def main() -> None:
     dataset = ResumeDataset(fact_data, cf_data)
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False)
 
-    fact_outs = _collect_mlp_outputs_intervened(
-        model, tokenizer, model_type, device, dataloader, num_layers, 
-        sensitive_heads, head_mean_emb, num_heads, head_dim, "fact_prompt"
-    )
-    cf_outs = _collect_mlp_outputs_intervened(
-        model, tokenizer, model_type, device, dataloader, num_layers, 
-        sensitive_heads, head_mean_emb, num_heads, head_dim, "cf_prompt"
-    )
+    def intervention_factory(output_pos: torch.Tensor):
+        hooks = []
+        for layer, head in sensitive_heads:
+            mean_emb = head_mean_emb.get((layer, head))
+            if mean_emb is None:
+                continue
+            hooks.append(
+                adapter.register_head_mean_replacement_hook(
+                    layer,
+                    head,
+                    mean_emb,
+                    output_pos,
+                    num_heads,
+                    head_dim,
+                )
+            )
+        return hooks
 
-    w_u = model.lm_head.weight.to(device=device, dtype=torch.float32)
-    final_norm = model.model.norm
+    fact_outs = collect_next_mlp_inputs(
+        model=model,
+        adapter=adapter,
+        tokenizer=tokenizer,
+        model_type=model_type,
+        dataloader=dataloader,
+        num_layers=num_layers,
+        prompt_key="fact_prompt",
+        intervention_factory=intervention_factory,
+    )
+    cf_outs = collect_next_mlp_inputs(
+        model=model,
+        adapter=adapter,
+        tokenizer=tokenizer,
+        model_type=model_type,
+        dataloader=dataloader,
+        num_layers=num_layers,
+        prompt_key="cf_prompt",
+        intervention_factory=intervention_factory,
+    )
     mlp_kl = np.zeros(num_layers)
     mlp_mean_diff = np.zeros(num_layers)
 
@@ -281,9 +225,12 @@ def main() -> None:
         f_hd = torch.from_numpy(fact_outs[l]).to(device)
         c_hd = torch.from_numpy(cf_outs[l]).to(device)
 
-        f_hd_norm = final_norm(f_hd)
-        c_hd_norm = final_norm(c_hd)
-        f_logits, c_logits = f_hd_norm @ w_u.t(), c_hd_norm @ w_u.t()
+        f_logits = adapter.project_residual_to_logits(
+            f_hd, apply_final_norm=False
+        ).float()
+        c_logits = adapter.project_residual_to_logits(
+            c_hd, apply_final_norm=False
+        ).float()
         f_probs = torch.softmax(f_logits[:, cand_ids].float(), dim=-1)
         c_probs = torch.softmax(c_logits[:, cand_ids].float(), dim=-1)
         p_y_f, p_y_c = f_probs[:, yes_mask].sum(-1), c_probs[:, yes_mask].sum(-1)
@@ -292,6 +239,23 @@ def main() -> None:
 
     np.save(os.path.join(args.output_dir, "mlp_kl_p_yes_intervened.npy"), mlp_kl)
     np.save(os.path.join(args.output_dir, "mlp_mean_diff_p_yes_intervened.npy"), mlp_mean_diff)
+    metadata = {
+        "model_path": args.model_path,
+        "dataset_json_path": args.dataset_json_path,
+        "biased_csv_path": args.biased_csv_path,
+        "sensitive_heads_path": args.sensitive_heads_path,
+        "embeddings_path": args.embeddings_path,
+        "sample_size": args.sample_size,
+        "num_layers": num_layers,
+        "num_samples": len(dataset),
+        "num_selected_heads": len(sensitive_heads),
+        "adapter_family": adapter.family,
+        "head_activation_kind": adapter.head_activation_kind,
+        "probe_surface": "next_mlp_input_cumulative_residual",
+        "probe_norm": "none",
+    }
+    with open(os.path.join(args.output_dir, "mlp_summary_intervened.json"), "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
     print(f"Saved intervened MLP metrics to {args.output_dir}")
 
 if __name__ == "__main__":

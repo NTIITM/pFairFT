@@ -50,6 +50,7 @@ from hook import (  # type: ignore  # noqa: E402
 from util import get_model_config  # type: ignore  # noqa: E402
 from cache import MLPDiskCache  # type: ignore  # noqa: E402
 from plot import plot_kl_heatmap  # type: ignore  # noqa: E402
+from model_adapter import get_model_adapter  # type: ignore  # noqa: E402
 
 
 class InterventionDataset(Dataset):
@@ -183,6 +184,8 @@ def main():
             args.model_type, model=model, tokenizer=tokenizer, model_path=args.model_path
         )
         print(f"Using model_type: {model_type}")
+        adapter = get_model_adapter(model, model_type=args.model_type, model_path=args.model_path)
+        print(f"Using adapter: {adapter.family} ({adapter.head_activation_kind})")
 
         device = torch.device(args.device)
 
@@ -288,12 +291,7 @@ def main():
         # 1) 先跑 CF，收集所有层的 MLP 激活
         hooks = []
         for l in range(num_layers):
-            if hasattr(model.model.layers[l], "mlp"):
-                layer_module = model.model.layers[l].mlp
-            else:
-                raise ValueError("Cannot find mlp module in transformer layer")
-            hook_fn = get_mlp_last_token_activation_hook(l, batch_mlp_buffer)
-            hooks.append(layer_module.register_forward_hook(hook_fn))
+            hooks.append(adapter.register_mlp_output_hook(l, batch_mlp_buffer))
 
         # DEBUG: 输出第一个样本用于调试
         first_batch_printed = False
@@ -409,10 +407,7 @@ def main():
         for l in range(num_layers):
             print(f"Processing Layer {l}/{num_layers - 1}...")
 
-            if not hasattr(model.model.layers[l], "mlp"):
-                raise ValueError(f"Layer {l} has no mlp module")
-
-            target_mlp = model.model.layers[l].mlp
+            target_mlp = adapter.get_mlp_module(l)
             layer_kl_sum = 0.0
             total_samples = 0
 
@@ -511,6 +506,13 @@ def main():
             "black_count": int(black_count),
             "intervention_method": "mlp_total_effect",
             "intervention_description": "Replace last-token MLP output of a layer with counterfactual activation",
+            "adapter_family": adapter.family,
+            "head_activation_kind": adapter.head_activation_kind,
+            "mlp_surface": "routed_moe_block_output",
+            "dataset_json_path": args.dataset_json_path,
+            "sample_csv_path": args.sample_csv_path or None,
+            "sample_size": args.sample_size if args.sample_csv_path else int(min_len),
+            "resume_prompt_mode": "summary_only",
         }
 
         with open(os.path.join(args.output_dir, "results_mlp.pkl"), "wb") as f:

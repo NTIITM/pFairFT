@@ -1007,7 +1007,7 @@ def get_mlp_last_token_activation_hook(
 def make_mlp_intervention_hook_mean_replacement(
     layer_idx: int,
     mean_embedding: torch.Tensor,
-    output_pos: int,
+    output_pos: Union[int, torch.Tensor],
 ) -> Callable:
     """
     创建用于 MLP 层统一均值替换干预的 hook。
@@ -1018,7 +1018,7 @@ def make_mlp_intervention_hook_mean_replacement(
     Args:
         layer_idx: 层索引
         mean_embedding: 均值激活值，形状为 [Hidden]
-        output_pos: 每个样本最后一个 token 的索引
+        output_pos: 所有样本共用的位置，或每个样本各自的最后 token 索引
 
     Returns:
         forward hook 函数（挂在对应层的 `mlp` 模块上）
@@ -1026,13 +1026,12 @@ def make_mlp_intervention_hook_mean_replacement(
     mean_embedding = mean_embedding.to(dtype=torch.float32)
 
     def hook(module, inputs, output):
-        # output: [Batch, Seq, Hidden]
-        new_output = output.clone()
+        hidden = output[0] if isinstance(output, tuple) else output
+        if not torch.is_tensor(hidden):
+            raise ValueError(f"Expected tensor MLP output, got {type(hidden)}")
+        new_output = hidden.clone()
         bsz, seqlen, hidden_dim = new_output.shape
         
-        if output_pos >= seqlen:
-            return new_output
-
         device = new_output.device
         mean_vec = mean_embedding.to(device=device, dtype=new_output.dtype)
         
@@ -1045,9 +1044,15 @@ def make_mlp_intervention_hook_mean_replacement(
                 padded[: mean_vec.shape[0]] = mean_vec
                 mean_vec = padded
 
-        # 对 batch 中每个样本都替换指定位置
-        new_output[:, output_pos, :] = mean_vec.unsqueeze(0).expand(bsz, -1)
+        if torch.is_tensor(output_pos):
+            batch_indices = torch.arange(bsz, device=device)
+            positions = output_pos.to(device).clamp(min=0, max=seqlen - 1)
+            new_output[batch_indices, positions, :] = mean_vec
+        elif int(output_pos) < seqlen:
+            new_output[:, int(output_pos), :] = mean_vec.unsqueeze(0).expand(bsz, -1)
 
+        if isinstance(output, tuple):
+            return (new_output,) + output[1:]
         return new_output
     
     return hook
@@ -1073,8 +1078,10 @@ def get_mlp_last_token_patch_hook(
     """
 
     def hook(module, inputs, output):
-        # output: [Batch, Seq, Hidden]
-        new_output = output.clone()
+        hidden = output[0] if isinstance(output, tuple) else output
+        if not torch.is_tensor(hidden):
+            raise ValueError(f"Expected tensor MLP output, got {type(hidden)}")
+        new_output = hidden.clone()
         bsz = new_output.shape[0]
         device = new_output.device
 
@@ -1084,6 +1091,8 @@ def get_mlp_last_token_patch_hook(
         cf_vals = cf_batch_tensor.to(device).to(new_output.dtype)
         new_output[batch_idxs, last_token_indices_on_device, :] = cf_vals
 
+        if isinstance(output, tuple):
+            return (new_output,) + output[1:]
         return new_output
     
     return hook

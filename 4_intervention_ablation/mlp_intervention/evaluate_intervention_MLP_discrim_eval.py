@@ -42,7 +42,6 @@ from prompt import (  # type: ignore  # noqa: E402
     add_yes_no_instruction,
     format_prompt_for_model,
     resolve_model_type,
-    build_category_prompt,
 )
 from sampling import load_discrim_eval_pairs  # type: ignore  # noqa: E402
 from util import (  # type: ignore  # noqa: E402
@@ -54,6 +53,7 @@ from hook import (  # type: ignore  # noqa: E402
     get_last_token_indices_safe,
     remove_intervention_hooks,
 )
+from model_adapter import get_model_adapter  # type: ignore  # noqa: E402
 
 
 def compute_stats_by_question(
@@ -101,55 +101,6 @@ def compute_stats_by_question(
     return stats
 
 
-def make_mlp_mean_replacement_hook(
-    layer_idx: int,
-    mean_embedding: torch.Tensor,
-    output_pos: int,
-) -> torch.nn.modules.module.Module.register_forward_hook:
-    """创建用于 MLP 层统一 mean ablation 的 forward hook。
-
-    挂载位置：model.model.layers[layer_idx].mlp
-    干预逻辑：在 output_pos 位置，将 MLP 输出替换为 mean_embedding。
-
-    Args:
-        layer_idx: 层索引，仅用于报错信息
-        mean_embedding: 统一均值向量 [hidden_size]
-        output_pos: 最后一个 token 的位置索引
-    """
-    mean_embedding = mean_embedding.to(dtype=torch.float32)
-
-    def hook(module, inputs, output):
-        # output: [Batch, Seq, Hidden]
-        if not isinstance(output, torch.Tensor):
-            raise ValueError(
-                f"MLP hook at layer {layer_idx}: expected Tensor output, got {type(output)}"
-            )
-
-        out = output.clone()
-        bsz, seqlen, hidden_dim = out.shape
-
-        if output_pos >= seqlen:
-            # 安全起见：不越界时才干预
-            return out
-
-        device = out.device
-        mean_vec = mean_embedding.to(device=device, dtype=out.dtype)
-        if mean_vec.shape[0] != hidden_dim:
-            # 对齐维度（截断或零填充），以防 hidden_size 变化
-            if mean_vec.shape[0] > hidden_dim:
-                mean_vec = mean_vec[:hidden_dim]
-            else:
-                padded = torch.zeros(hidden_dim, dtype=mean_vec.dtype, device=mean_vec.device)
-                padded[: mean_vec.shape[0]] = mean_vec
-                mean_vec = padded
-
-        # 对 batch 中每个样本都替换指定位置
-        out[:, output_pos, :] = mean_vec.unsqueeze(0).expand(bsz, -1)
-        return out
-
-    return hook
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -172,7 +123,7 @@ def main() -> None:
         "--model_type",
         type=str,
         default="auto",
-        choices=["auto", "llama", "qwen", "deepseek"],
+        choices=["auto", "llama", "qwen", "deepseek", "olmoe", "jetmoe"],
         help="Model architecture. Use 'auto' to infer from model/tokenizer.",
     )
     parser.add_argument(
@@ -202,6 +153,11 @@ def main() -> None:
             "If set, append per-sample intervention results to this CSV file "
             "(sample_id, matched_id, model, decision_question_id, p_yes, intervention_type)."
         ),
+    )
+    parser.add_argument(
+        "--append_csv",
+        action="store_true",
+        help="Append to --csv_path instead of replacing it.",
     )
     parser.add_argument(
         "--sensitive_mlp_path",
@@ -279,6 +235,8 @@ def main() -> None:
         model_path=args.model_path,
     )
     print(f"Using model_type: {model_type}")
+    adapter = get_model_adapter(model, model_type=args.model_type, model_path=args.model_path)
+    print(f"Using adapter: {adapter.family} ({adapter.head_activation_kind})")
 
     # 3. Get token IDs
     yes_ids = get_target_token_ids(tokenizer, YES_CANDIDATES)
@@ -335,7 +293,7 @@ def main() -> None:
     # 5. Prepare prompts
     prompt_key = args.prompt_type
     prompts: List[str] = [
-        add_yes_no_instruction(build_category_prompt(item[prompt_key], "")) for item in data
+        add_yes_no_instruction(item[prompt_key]) for item in data
     ]
 
     # 6. Compute p(yes) with MLP mean ablation intervention
@@ -370,7 +328,6 @@ def main() -> None:
             if l not in white_emb or l not in black_emb:
                 continue
 
-            target_module = model.model.layers[l].mlp
             mean_emb_np = (white_emb[l] + black_emb[l]) / 2.0
             mean_emb = (
                 torch.from_numpy(mean_emb_np).float()
@@ -378,12 +335,11 @@ def main() -> None:
                 else mean_emb_np
             )
 
-            hook_fn = make_mlp_mean_replacement_hook(
+            hook = adapter.register_mlp_mean_replacement_hook(
                 layer_idx=l,
                 mean_embedding=mean_emb,
                 output_pos=output_pos,
             )
-            hook = target_module.register_forward_hook(hook_fn)
             prompt_hooks.append(hook)
 
         try:
@@ -442,12 +398,13 @@ def main() -> None:
 
     # 9. Save per-sample CSV (if path provided)
     if args.csv_path:
-        file_exists = os.path.exists(args.csv_path)
-        print(f"Appending per-sample intervention details to CSV: {args.csv_path}...")
+        print(f"Writing per-sample intervention details to CSV: {args.csv_path}...")
         os.makedirs(os.path.dirname(args.csv_path) or ".", exist_ok=True)
-        with open(args.csv_path, "a", newline="", encoding="utf-8") as f:
+        mode = "a" if args.append_csv else "w"
+        write_header = not args.append_csv or not os.path.exists(args.csv_path)
+        with open(args.csv_path, mode, newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            if not file_exists:
+            if write_header:
                 writer.writerow(
                     [
                         "sample_id",
@@ -484,6 +441,28 @@ def main() -> None:
                     ]
                 )
         print(f"Saved CSV: {args.csv_path}")
+
+    metadata = {
+        "model_path": args.model_path,
+        "model_type": model_type,
+        "adapter_family": adapter.family,
+        "head_activation_kind": adapter.head_activation_kind,
+        "mlp_surface": "routed_moe_block_output",
+        "dataset": "discrim_eval_transfer",
+        "dataset_path": args.dataset_path,
+        "prompt_type": args.prompt_type,
+        "num_samples": len(data),
+        "num_pairs": len(pairs),
+        "sensitive_mlp_path": args.sensitive_mlp_path,
+        "mlp_embeddings_path": args.mlp_embeddings_path,
+        "selected_layers": sensitive_layers,
+        "intervention_type": args.intervention_type,
+        "seed": args.seed,
+        "csv_path": args.csv_path or None,
+        "stats_by_question": {str(k): v for k, v in stats.items()},
+    }
+    with open(os.path.join(args.output_dir, "metadata.json"), "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
 
     # 10. Print summary
     print("\n" + "=" * 60)

@@ -19,7 +19,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'src'))
 
 from util import get_model_config, get_input_device
-from prompt import resolve_model_type, add_yes_no_instruction
+from prompt import resolve_model_type, build_resume_prompt
+from model_adapter import get_model_adapter
 
 
 def extract_qk_scores_via_attentions(
@@ -168,13 +169,13 @@ def main():
         "--sample_csv_path",
         type=str,
         required=False,
-        help="Path to biased_samples_ranking.csv from exp2 (not used, kept for compatibility)",
+        help="Path to the current Resume biased-sample ranking CSV.",
     )
     parser.add_argument(
         "--dataset_json_path",
         type=str,
         default="/home/common1/hwluo/project/pFairFT/data/resume/qwen_summaries_with_race.json",
-        help="Path to the dataset JSON file (not used, kept for compatibility)",
+        help="Path to the canonical Resume dataset JSON file.",
     )
     parser.add_argument(
         "--output_dir",
@@ -192,8 +193,14 @@ def main():
         "--model_type",
         type=str,
         default="auto",
-        choices=["auto", "llama", "qwen", "deepseek"],
+        choices=["auto", "llama", "qwen", "deepseek", "olmoe", "jetmoe"],
         help="Model architecture type",
+    )
+    parser.add_argument(
+        "--prompt_source",
+        choices=["fixed", "resume_rank1"],
+        default="fixed",
+        help="Use the paper's fixed short prompt or rank 1 from the Resume ranking.",
     )
     args = parser.parse_args()
     
@@ -224,6 +231,8 @@ def main():
     
     model_type = resolve_model_type(args.model_type, model=model, tokenizer=tokenizer, model_path=args.model_path)
     print(f"Using model_type: {model_type}")
+    adapter = get_model_adapter(model, model_type=args.model_type, model_path=args.model_path)
+    print(f"Using adapter: {adapter.family} ({adapter.head_activation_kind})")
     
     # Get model configuration
     config = get_model_config(model)
@@ -240,12 +249,24 @@ def main():
     sensitive_heads = load_sensitive_heads(args.sensitive_heads_path)
     print(f"Loaded {len(sensitive_heads)} sensitive heads")
     
-    # Use fixed test case
-    candidate_description = "Black candidate has 26 years' expertise."
+    if args.prompt_source == "resume_rank1":
+        if not args.sample_csv_path:
+            raise ValueError("--sample_csv_path is required for --prompt_source resume_rank1")
+        sample = load_first_sample(args.sample_csv_path, args.dataset_json_path)
+        candidate_description = str(sample.get("summary", ""))
+        if not candidate_description:
+            raise ValueError("Rank-1 Resume sample has no summary.")
+        prompt = build_resume_prompt(
+            candidate_description,
+            str(sample.get("category", "")),
+            mode="summary_only",
+        )
+        sample_index = int(sample["index"])
+    else:
+        candidate_description = "Black candidate has 26 years' expertise."
+        prompt = f"{candidate_description} Do we hire Her?"
+        sample_index = None
     print(f"Using test case: {candidate_description}")
-    
-    # Build prompt: candidate description + yes/no answering part
-    prompt = f"{candidate_description} Do we hire Her?"
     formatted_prompt = prompt
     
     print("=" * 80)
@@ -293,6 +314,15 @@ def main():
         "qk_scores": {k: v.tolist() for k, v in qk_scores_dict.items()},
         "sensitive_heads": [{"layer": l, "head": h} for l, h in sensitive_heads],
         "candidate_description": candidate_description,
+        "prompt_source": args.prompt_source,
+        "sample_index": sample_index,
+        "model_path": args.model_path,
+        "model_type": model_type,
+        "adapter_family": adapter.family,
+        "head_activation_kind": adapter.head_activation_kind,
+        "dataset_json_path": args.dataset_json_path,
+        "sample_csv_path": args.sample_csv_path,
+        "sensitive_heads_path": args.sensitive_heads_path,
         "sequence_length": int(inputs["input_ids"].shape[1]),
         "formatted_prompt": formatted_prompt,
     }
@@ -306,6 +336,8 @@ def main():
         "score_type": "post_softmax_attention",
         "sensitive_heads": [{"layer": l, "head": h} for l, h in sensitive_heads],
         "candidate_description": candidate_description,
+        "prompt_source": args.prompt_source,
+        "sample_index": sample_index,
         "sequence_length": int(inputs["input_ids"].shape[1]),
         "qk_scores_info": {
             f"layer_{l}_head_{h}": {

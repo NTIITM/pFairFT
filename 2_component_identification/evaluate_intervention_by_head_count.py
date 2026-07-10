@@ -44,11 +44,10 @@ from util import (
 from sampling import sample_resume_data_by_race, load_samples_by_csv_indices
 from hook import (
     get_last_token_indices_safe,
-    make_intervention_hook_mean_replacement,
     remove_intervention_hooks,
     make_positive_direction_hook,
-    get_activation_hook_for_intervention,
 )
+from model_adapter import get_model_adapter
 
 
 def _race_to_group(race: str) -> Optional[int]:
@@ -65,6 +64,7 @@ def _race_to_group(race: str) -> Optional[int]:
 
 def compute_p_yes_with_intervention(
     model,
+    adapter,
     tokenizer,
     prompt: str,
     model_type: str,
@@ -97,8 +97,6 @@ def compute_p_yes_with_intervention(
         if (l, h) not in white_emb or (l, h) not in black_emb:
             continue
 
-        target_module = model.model.layers[l].self_attn.o_proj
-
         if intervention_type == "negative":
             # 负向干预：mean ablation
             mean_emb_np = (white_emb[(l, h)] + black_emb[(l, h)]) / 2.0
@@ -107,13 +105,17 @@ def compute_p_yes_with_intervention(
                 if isinstance(mean_emb_np, np.ndarray)
                 else mean_emb_np
             )
-            hook_fn = make_intervention_hook_mean_replacement(
+            hook = adapter.register_head_mean_replacement_hook(
                 l, h, mean_emb, output_pos, num_heads, head_dim
             )
-            hook = target_module.register_forward_pre_hook(hook_fn)
             prompt_hooks.append(hook)
 
         elif intervention_type == "positive":
+            target_module = adapter.get_head_activation_module(l)
+            if adapter.head_activation_kind != "o_proj_input":
+                raise NotImplementedError(
+                    "Positive direction intervention currently requires an o_proj-input head surface."
+                )
             # 正向干预：方向增强
             if head_directions is None or (l, h) not in head_directions:
                 continue
@@ -160,6 +162,7 @@ def compute_p_yes_with_intervention(
 
 def compute_head_directions(
     model,
+    adapter,
     tokenizer,
     samples: List[Dict],
     sensitive_heads: List[Tuple[int, int]],
@@ -245,11 +248,11 @@ def compute_head_directions(
         batch_activations_buffer: Dict[int, torch.Tensor] = {}
         hooks = []
         for l in range(num_layers):
-            layer_module = model.model.layers[l].self_attn.o_proj
-            hook_fn = get_activation_hook_for_intervention(
-                l, num_heads, head_dim, batch_activations_buffer
+            hooks.append(
+                adapter.register_head_activation_hook(
+                    l, num_heads, head_dim, batch_activations_buffer
+                )
             )
-            hooks.append(layer_module.register_forward_hook(hook_fn))
 
         with torch.no_grad():
             _ = model(**enc)
@@ -377,6 +380,11 @@ def main():
         help="Path to the dataset JSON file.",
     )
     parser.add_argument(
+        "--resume_prompt_mode",
+        choices=["summary_only", "category"],
+        default="summary_only",
+    )
+    parser.add_argument(
         "--output_dir",
         type=str,
         default="intervention_by_head_count_results",
@@ -481,6 +489,8 @@ def main():
 
     model_type = resolve_model_type(args.model_type, model=model, tokenizer=tokenizer, model_path=args.model_path)
     print(f"Using model_type: {model_type}")
+    adapter = get_model_adapter(model, model_type=args.model_type, model_path=args.model_path)
+    print(f"Using adapter: {adapter.family} ({adapter.head_activation_kind})")
 
     yes_ids = get_target_token_ids(tokenizer, YES_CANDIDATES)
     no_ids = get_target_token_ids(tokenizer, NO_CANDIDATES)
@@ -535,10 +545,14 @@ def main():
         category = item.get("category", "")
         race_str = item.get("race", "")
 
-        if not summary or not category:
+        if not summary or (args.resume_prompt_mode == "category" and not category):
             continue
 
-        query = build_category_prompt(summary, category)
+        query = (
+            summary
+            if args.resume_prompt_mode == "summary_only"
+            else build_category_prompt(summary, category)
+        )
 
         extracted_race = extract_race_from_query(query)
         if extracted_race is None:
@@ -621,6 +635,7 @@ def main():
         direction_cache_path = os.path.join(args.output_dir, "head_directions_fact_cf.pkl")
         head_directions, head_std = compute_head_directions(
             model=model,
+            adapter=adapter,
             tokenizer=tokenizer,
             samples=samples,
             sensitive_heads=all_sensitive_heads,
@@ -688,10 +703,35 @@ def main():
         print("=" * 80)
 
     # 生成要测试的头数量列表（0, 5, 10, 15, ..., max_head_count）
-    head_counts = list(range(0, min(args.max_head_count + 1, len(all_sensitive_heads) + 1), args.step))
-    if len(all_sensitive_heads) < args.step:
-        head_counts = [0, len(all_sensitive_heads)] if len(all_sensitive_heads) > 0 else [0]
+    max_n = min(args.max_head_count, len(all_sensitive_heads))
+    head_counts = list(range(0, max_n + 1, args.step))
+    if max_n not in head_counts:
+        head_counts.append(max_n)
+    head_counts = sorted(set(head_counts))
     print(f"Will test head counts: {head_counts}")
+
+    metadata = {
+        "experiment": "resume_head_count_sensitive",
+        "model_path": args.model_path,
+        "model_type": model_type,
+        "adapter_family": adapter.family,
+        "head_activation_kind": adapter.head_activation_kind,
+        "dataset_json_path": args.dataset_json_path,
+        "sample_csv_path": args.sample_csv_path,
+        "sample_size": len(samples),
+        "embeddings_path": embeddings_path,
+        "intervention_type": args.intervention_type,
+        "head_counts": head_counts,
+        "selected_heads_by_count": {
+            str(count): [list(head) for head in all_sensitive_heads[:count]]
+            for count in head_counts
+        },
+        "seed": args.seed,
+        "resume_prompt_mode": args.resume_prompt_mode,
+        "head_ranking_scope": "all_heads_sorted_by_importance",
+    }
+    with open(os.path.join(args.output_dir, "metadata.json"), "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
 
     # 准备CSV输出
     csv_path = os.path.join(args.output_dir, "intervention_results_by_head_count.csv")
@@ -786,6 +826,7 @@ def main():
                 # 计算事实概率（带干预）
                 fact_p_yes = compute_p_yes_with_intervention(
                     model=model,
+                    adapter=adapter,
                     tokenizer=tokenizer,
                     prompt=fact_item["query"],
                     model_type=model_type,
@@ -816,6 +857,7 @@ def main():
                 
                 cf_p_yes = compute_p_yes_with_intervention(
                     model=model,
+                    adapter=adapter,
                     tokenizer=tokenizer,
                     prompt=cf_item["query"],
                     model_type=model_type,

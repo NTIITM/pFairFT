@@ -40,7 +40,6 @@ from prompt import (  # noqa: E402
     add_yes_no_instruction,
     format_prompt_for_model,
     resolve_model_type,
-    build_category_prompt
 )
 from sampling import load_discrim_eval_pairs  # noqa: E402
 from util import (  # noqa: E402
@@ -50,9 +49,9 @@ from util import (  # noqa: E402
 )
 from hook import (  # noqa: E402
     get_last_token_indices_safe,
-    make_intervention_hook_mean_replacement,
     remove_intervention_hooks,
 )
+from model_adapter import get_model_adapter  # noqa: E402
 
 
 def compute_stats_by_question(
@@ -125,7 +124,7 @@ def main():
         "--model_type",
         type=str,
         default="auto",
-        choices=["auto", "llama", "qwen", "deepseek"],
+        choices=["auto", "llama", "qwen", "deepseek", "olmoe", "jetmoe"],
         help="Model architecture. Use 'auto' to infer from model/tokenizer.",
     )
     parser.add_argument(
@@ -155,6 +154,11 @@ def main():
             "If set, append per-sample intervention results to this CSV file "
             "(sample_id, model, decision_question_id, p_yes, intervention_type)."
         ),
+    )
+    parser.add_argument(
+        "--append_csv",
+        action="store_true",
+        help="Append to --csv_path instead of replacing it. Disabled by default.",
     )
     parser.add_argument(
         "--sensitive_heads_dir",
@@ -250,6 +254,8 @@ def main():
         model_path=args.model_path,
     )
     print(f"Using model_type: {model_type}")
+    adapter = get_model_adapter(model, model_type=args.model_type, model_path=args.model_path)
+    print(f"Using adapter: {adapter.family} ({adapter.head_activation_kind})")
 
     # 3. Get token IDs
     yes_ids = get_target_token_ids(tokenizer, YES_CANDIDATES)
@@ -375,12 +381,29 @@ def main():
             "Intervention mode: negative (mean ablation on race-sensitive heads)"
         )
 
+    metadata = {
+        "experiment": "discrim_all_selected_or_random_heads",
+        "model_path": args.model_path,
+        "model_type": model_type,
+        "adapter_family": adapter.family,
+        "head_activation_kind": adapter.head_activation_kind,
+        "dataset_path": args.dataset_path,
+        "prompt_type": args.prompt_type,
+        "sensitive_heads_path": sensitive_heads_path,
+        "embeddings_path": embeddings_path,
+        "intervention_mode": args.intervention_mode,
+        "selected_heads": [list(head) for head in heads_for_intervention],
+        "seed": args.seed,
+        "rows": len(data),
+        "pairs": len(pairs),
+    }
+    with open(os.path.join(args.output_dir, "metadata.json"), "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
+
     # 5. Prepare prompts
     prompt_key = args.prompt_type
     prompts: List[str] = [
-        add_yes_no_instruction(build_category_prompt(item[prompt_key],"")) for item in data
-        # add_yes_no_instruction(item[prompt_key]) for item in data
-
+        add_yes_no_instruction(item[prompt_key]) for item in data
     ]
 
     # 6. Compute p(yes) with intervention
@@ -417,8 +440,6 @@ def main():
             if (l, h) not in white_emb or (l, h) not in black_emb:
                 continue
 
-            target_module = model.model.layers[l].self_attn.o_proj
-
             # 负向干预：mean ablation
             mean_emb_np = (white_emb[(l, h)] + black_emb[(l, h)]) / 2.0
             mean_emb = (
@@ -426,7 +447,7 @@ def main():
                 if isinstance(mean_emb_np, np.ndarray)
                 else mean_emb_np
             )
-            hook_fn = make_intervention_hook_mean_replacement(
+            hook = adapter.register_head_mean_replacement_hook(
                 l,
                 h,
                 mean_emb,
@@ -434,7 +455,6 @@ def main():
                 num_heads,
                 head_dim,
             )
-            hook = target_module.register_forward_pre_hook(hook_fn)
             prompt_hooks.append(hook)
 
         try:
@@ -497,10 +517,12 @@ def main():
 
     # 9. Save per-sample CSV (if path provided)
     if args.csv_path:
-        file_exists = os.path.exists(args.csv_path)
-        print(f"Appending per-sample intervention details to CSV: {args.csv_path}...")
+        file_exists = args.append_csv and os.path.exists(args.csv_path)
+        action = "Appending" if args.append_csv else "Writing"
+        print(f"{action} per-sample intervention details to CSV: {args.csv_path}...")
         os.makedirs(os.path.dirname(args.csv_path) or ".", exist_ok=True)
-        with open(args.csv_path, "a", newline="", encoding="utf-8") as f:
+        mode = "a" if args.append_csv else "w"
+        with open(args.csv_path, mode, newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             if not file_exists:
                 writer.writerow(
@@ -567,4 +589,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

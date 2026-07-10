@@ -29,9 +29,9 @@ from probability import YES_CANDIDATES, NO_CANDIDATES, get_target_token_ids
 from util import get_model_config
 from hook import (
     get_last_token_indices_safe,
-    get_activation_hook_for_intervention,
 )
 from sampling import load_discrim_eval_pairs
+from model_adapter import get_model_adapter
 
 class DiscrimEvalPairedDataset(Dataset):
     def __init__(self, pairs: List[Tuple[dict, dict]], prompt_key: str):
@@ -55,7 +55,7 @@ def _kl_pq(p: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
     q = torch.clamp(q, eps, 1.0)
     return torch.sum(p * (torch.log(p) - torch.log(q)), dim=-1)
 
-def run_analysis(model, tokenizer, dataloader, model_type, device, output_prefix):
+def run_analysis(model, adapter, tokenizer, dataloader, model_type, output_prefix):
     config = get_model_config(model)
     num_layers = config["num_layers"]
     num_heads = config["num_heads"]
@@ -64,27 +64,30 @@ def run_analysis(model, tokenizer, dataloader, model_type, device, output_prefix
     yes_ids = get_target_token_ids(tokenizer, YES_CANDIDATES)
     no_ids = get_target_token_ids(tokenizer, NO_CANDIDATES)
     cand_ids_list = list(dict.fromkeys(yes_ids + no_ids))
-    w_u = model.lm_head.weight
 
     batch_activations_buffer = {}
     hooks = []
     for l in range(num_layers):
-        layer_module = model.model.layers[l].self_attn.o_proj
-        hook_fn = get_activation_hook_for_intervention(l, num_heads, head_dim, batch_activations_buffer)
-        hooks.append(layer_module.register_forward_hook(hook_fn))
+        hooks.append(
+            adapter.register_head_activation_hook(
+                l, num_heads, head_dim, batch_activations_buffer
+            )
+        )
+
+    input_device = adapter.get_input_embedding_module().weight.device
 
     def collect_acts(is_fact=True):
         all_acts = {}
         key = "fact_prompt" if is_fact else "cf_prompt"
         for batch in tqdm(dataloader, desc=f"Collecting {'Fact' if is_fact else 'CF'} Acts"):
             prompts = [format_prompt_for_model(p, model_type) for p in batch[key]]
-            inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, add_special_tokens=False).to(device)
+            inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, add_special_tokens=False).to(input_device)
             last_token_indices = get_last_token_indices_safe(
                 inputs["input_ids"],
                 inputs.get("attention_mask"),
                 tokenizer,
             )
-            batch_range = torch.arange(inputs["input_ids"].shape[0], device=device)
+            batch_range = torch.arange(inputs["input_ids"].shape[0], device=input_device)
             batch_activations_buffer.clear()
             with torch.no_grad():
                 _ = model(**inputs)
@@ -111,19 +114,21 @@ def run_analysis(model, tokenizer, dataloader, model_type, device, output_prefix
     mean_diff_p_yes = np.zeros((num_layers, num_heads))
 
     for l in range(num_layers):
-        o_proj_weight = model.model.layers[l].self_attn.o_proj.weight
-        o_proj_device = o_proj_weight.device
-        w_u_on_device = w_u.to(device=o_proj_device, dtype=o_proj_weight.dtype)
-        cand_ids = torch.tensor(cand_ids_list, device=o_proj_device)
-        yes_mask = torch.tensor([int(tid in set(yes_ids)) for tid in cand_ids_list], dtype=torch.bool, device=o_proj_device)
-
         for h in range(num_heads):
-            f_hd = torch.from_numpy(fact_acts[(l, h)]).to(device=o_proj_device, dtype=o_proj_weight.dtype)
-            c_hd = torch.from_numpy(cf_acts[(l, h)]).to(device=o_proj_device, dtype=o_proj_weight.dtype)
-            o_slice = o_proj_weight[:, h*head_dim : (h+1)*head_dim]
-            
-            f_logits = (f_hd @ o_slice.t()) @ w_u_on_device.t()
-            c_logits = (c_hd @ o_slice.t()) @ w_u_on_device.t()
+            f_hd = torch.from_numpy(fact_acts[(l, h)])
+            c_hd = torch.from_numpy(cf_acts[(l, h)])
+            f_logits = adapter.project_head_activations_to_logits(
+                l, h, f_hd, num_heads, head_dim
+            )
+            c_logits = adapter.project_head_activations_to_logits(
+                l, h, c_hd, num_heads, head_dim
+            )
+            cand_ids = torch.tensor(cand_ids_list, device=f_logits.device)
+            yes_mask = torch.tensor(
+                [int(tid in set(yes_ids)) for tid in cand_ids_list],
+                dtype=torch.bool,
+                device=f_logits.device,
+            )
             
             f_probs = torch.softmax(f_logits[:, cand_ids].float(), dim=-1)
             c_probs = torch.softmax(c_logits[:, cand_ids].float(), dim=-1)
@@ -153,8 +158,9 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(args.model_path, device_map="auto", torch_dtype=torch.float16, trust_remote_code=True)
     model.eval()
     
-    device = next(model.parameters()).device
     model_type = resolve_model_type("auto", model=model, tokenizer=tokenizer, model_path=args.model_path)
+    adapter = get_model_adapter(model, model_type="auto", model_path=args.model_path)
+    print(f"Using adapter: {adapter.family} ({adapter.head_activation_kind})")
 
     data, pairs = load_discrim_eval_pairs(args.dataset_path)
     id_to_sample = {item["id"]: item for item in data}
@@ -168,7 +174,20 @@ def main():
         print(f"Analyzing {p_type}...")
         ds = DiscrimEvalPairedDataset(target_pairs, p_type)
         dl = DataLoader(ds, batch_size=8, shuffle=False)
-        run_analysis(model, tokenizer, dl, model_type, device, os.path.join(args.output_dir, p_type))
+        run_analysis(model, adapter, tokenizer, dl, model_type, os.path.join(args.output_dir, p_type))
+
+    metadata = {
+        "model_path": args.model_path,
+        "dataset_path": args.dataset_path,
+        "qid": args.qid,
+        "num_pairs": len(target_pairs),
+        "model_type": model_type,
+        "adapter_family": adapter.family,
+        "head_activation_kind": adapter.head_activation_kind,
+        "conditions": ["prompt", "debiased_prompt"],
+    }
+    with open(os.path.join(args.output_dir, "metadata.json"), "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
 
 if __name__ == "__main__":
     main()

@@ -7,6 +7,7 @@ Reference: exp1/evaluate_bias.py
 
 import argparse
 import csv
+import json
 import math
 import os
 import sys
@@ -88,6 +89,16 @@ def main():
         default="",
         help="Suffix to append to model name in CSV.",
     )
+    parser.add_argument(
+        "--prompt_type",
+        choices=["prompt", "debiased_prompt"],
+        default="prompt",
+    )
+    parser.add_argument(
+        "--append_csv",
+        action="store_true",
+        help="Append to --csv_path instead of replacing it.",
+    )
     args = parser.parse_args()
 
     data, pairs = load_discrim_eval_pairs(args.dataset_path)
@@ -126,7 +137,7 @@ def main():
     yes_ids = get_target_token_ids(tokenizer, YES_CANDIDATES)
     no_ids = get_target_token_ids(tokenizer, NO_CANDIDATES)
 
-    prompt_type = "prompt"
+    prompt_type = args.prompt_type
 
     os.makedirs(os.path.dirname(args.csv_path) or ".", exist_ok=True)
 
@@ -160,7 +171,8 @@ def main():
         )
 
     os.makedirs(os.path.dirname(args.csv_path) or ".", exist_ok=True)
-    with open(args.csv_path, "a+", newline="", encoding="utf-8") as f:
+    file_mode = "a+" if args.append_csv else "w+"
+    with open(args.csv_path, file_mode, newline="", encoding="utf-8") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         try:
             f.seek(0, os.SEEK_END)
@@ -173,6 +185,24 @@ def main():
             os.fsync(f.fileno())
         finally:
             fcntl.flock(f, fcntl.LOCK_UN)
+
+    metadata = {
+        "dataset": "discrim_eval_transfer",
+        "dataset_path": args.dataset_path,
+        "base_model_path": args.base_model_path,
+        "adapter_path": args.adapter_path,
+        "mode": args.mode,
+        "model_type": model_type,
+        "model_name": model_name,
+        "prompt_type": prompt_type,
+        "num_dataset_rows": len(data),
+        "num_pairs": len(pairs),
+        "num_output_rows": len(rows),
+        "csv_path": args.csv_path,
+        "append_csv": args.append_csv,
+    }
+    with open(args.csv_path + ".metadata.json", "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
 
     print(f"Finished evaluating {model_name}. Results saved to {args.csv_path}")
 

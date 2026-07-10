@@ -54,13 +54,14 @@ from util import (
 )
 from hook import (
     get_last_token_indices_safe,
-    make_intervention_hook_mean_replacement,
     remove_intervention_hooks,
 )
+from model_adapter import get_model_adapter
 
 
 def compute_p_yes_with_intervention(
     model,
+    adapter,
     tokenizer,
     prompt: str,
     model_type: str,
@@ -88,8 +89,6 @@ def compute_p_yes_with_intervention(
         if (l, h) not in white_emb or (l, h) not in black_emb:
             continue
 
-        target_module = model.model.layers[l].self_attn.o_proj
-
         # 负向干预：mean ablation
         mean_emb_np = (white_emb[(l, h)] + black_emb[(l, h)]) / 2.0
         mean_emb = (
@@ -97,10 +96,9 @@ def compute_p_yes_with_intervention(
             if isinstance(mean_emb_np, np.ndarray)
             else mean_emb_np
         )
-        hook_fn = make_intervention_hook_mean_replacement(
+        hook = adapter.register_head_mean_replacement_hook(
             l, h, mean_emb, output_pos, num_heads, head_dim
         )
-        hook = target_module.register_forward_pre_hook(hook_fn)
         prompt_hooks.append(hook)
 
     try:
@@ -193,7 +191,7 @@ def main():
         "--model_type",
         type=str,
         default="auto",
-        choices=["auto", "llama", "qwen", "deepseek"],
+        choices=["auto", "llama", "qwen", "deepseek", "olmoe", "jetmoe"],
         help="Model architecture. Use 'auto' to infer from model/tokenizer.",
     )
     parser.add_argument(
@@ -304,6 +302,8 @@ def main():
         model_path=args.model_path,
     )
     print(f"Using model_type: {model_type}")
+    adapter = get_model_adapter(model, model_type=args.model_type, model_path=args.model_path)
+    print(f"Using adapter: {adapter.family} ({adapter.head_activation_kind})")
 
     yes_ids = get_target_token_ids(tokenizer, YES_CANDIDATES)
     no_ids = get_target_token_ids(tokenizer, NO_CANDIDATES)
@@ -371,11 +371,16 @@ def main():
 
     # 4. Main loop: iterate head_count
     # head_counts = [0, step, 2*step, ..., max_head_count]
-    head_counts = list(range(0, min(args.max_head_count + 1, len(all_sensitive_heads) + 1), args.step))
-    if len(all_sensitive_heads) < args.step:
-        head_counts = [0, len(all_sensitive_heads)] if len(all_sensitive_heads) > 0 else [0]
+    max_n = min(args.max_head_count, len(all_sensitive_heads))
+    if args.intervention_mode == "negative_random":
+        max_n = min(max_n, len(non_sensitive_heads))
+    head_counts = list(range(0, max_n + 1, args.step))
+    if max_n not in head_counts:
+        head_counts.append(max_n)
+    head_counts = sorted(set(head_counts))
 
     print(f"Will test head counts: {head_counts}")
+    selected_heads_by_count: Dict[str, List[List[int]]] = {}
 
     # 准备CSV输出
     csv_path = os.path.join(args.output_dir, args.results_csv_name)
@@ -418,6 +423,7 @@ def main():
             print(f"Using {len(current_heads)} heads: {current_heads[:5]}..." if len(current_heads) > 5 else f"Using heads: {current_heads}")
         else:
             print("Using baseline (no intervention)")
+        selected_heads_by_count[str(head_count)] = [list(head) for head in current_heads]
 
         # 计算每个样本的 p(yes) - 无论是否干预
         p_yes_map: Dict[int, float] = {}
@@ -454,6 +460,7 @@ def main():
             )):
                 p_yes = compute_p_yes_with_intervention(
                     model=model,
+                    adapter=adapter,
                     tokenizer=tokenizer,
                     prompt=prompt,
                     model_type=model_type,
@@ -485,6 +492,23 @@ def main():
             ])
     
     csv_file.close()
+    metadata = {
+        "experiment": "discrim_head_count",
+        "model_path": args.model_path,
+        "model_type": model_type,
+        "adapter_family": adapter.family,
+        "head_activation_kind": adapter.head_activation_kind,
+        "dataset_path": args.dataset_path,
+        "embeddings_path": embeddings_path,
+        "intervention_mode": args.intervention_mode,
+        "head_counts": head_counts,
+        "selected_heads_by_count": selected_heads_by_count,
+        "seed": args.seed,
+        "rows": len(data),
+        "pairs": len(pairs),
+    }
+    with open(os.path.join(args.output_dir, "metadata.json"), "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
     print(f"\nSaved results to: {csv_path}")
 
     print("\n" + "=" * 60)

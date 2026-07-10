@@ -33,7 +33,6 @@ from prompt import (
     add_yes_no_instruction,
     format_prompt_for_model,
     resolve_model_type,
-    build_category_prompt
 )
 from sampling import load_discrim_eval_pairs
 from util import (
@@ -43,10 +42,9 @@ from util import (
 )
 from hook import (
     get_last_token_indices_safe,
-    make_intervention_hook_debias_projection,
     remove_intervention_hooks,
-    create_config_detection_hook,
 )
+from model_adapter import get_model_adapter
 
 def compute_stats_by_question(
     pairs: List[Tuple[int, int]],
@@ -96,6 +94,8 @@ def main():
 
     input_device = get_input_device(model, "cuda")
     model_type = resolve_model_type(args.model_type, model=model, tokenizer=tokenizer, model_path=args.model_path)
+    adapter = get_model_adapter(model, model_type=args.model_type, model_path=args.model_path)
+    print(f"Using adapter: {adapter.family} ({adapter.head_activation_kind})")
     yes_ids, no_ids = get_target_token_ids(tokenizer, YES_CANDIDATES), get_target_token_ids(tokenizer, NO_CANDIDATES)
 
     if not args.sensitive_heads_dir:
@@ -119,15 +119,15 @@ def main():
     
     # Config detection
     temp_buffer = {}
-    detect_hook = model.model.layers[0].self_attn.o_proj.register_forward_hook(create_config_detection_hook(temp_buffer))
+    detect_hook = adapter.register_config_detection_hook(temp_buffer)
     try:
-        test_in = tokenizer([format_prompt_for_model(add_yes_no_instruction(build_category_prompt(data[0]["prompt"],"")), model_type)], return_tensors="pt", add_special_tokens=False).to(input_device)
+        test_in = tokenizer([format_prompt_for_model(add_yes_no_instruction(data[0]["prompt"]), model_type)], return_tensors="pt", add_special_tokens=False).to(input_device)
         with torch.no_grad(): _ = model(**test_in)
     finally: detect_hook.remove()
     num_heads, head_dim = temp_buffer.get("num_heads", num_heads), temp_buffer.get("head_dim", head_dim)
 
     p_yes_results = []
-    prompts = [add_yes_no_instruction(build_category_prompt(item["prompt"],"")) for item in data]
+    prompts = [add_yes_no_instruction(item["prompt"]) for item in data]
 
     for item, prompt in tqdm(zip(data, prompts), total=len(data), desc=f"Eval {args.intervention_mode}"):
         f_prompt = format_prompt_for_model(prompt, model_type)
@@ -138,8 +138,20 @@ def main():
         hooks = []
         for l, h in target_heads:
             if (l, h) in white_emb and (l, h) in black_emb:
-                hook_fn = make_intervention_hook_debias_projection(l, h, torch.from_numpy(white_emb[(l, h)]).float(), torch.from_numpy(black_emb[(l, h)]).float(), None, pos, args.intervention_strength, num_heads, head_dim)
-                hooks.append(model.model.layers[l].self_attn.o_proj.register_forward_pre_hook(hook_fn))
+                hooks.append(
+                    adapter.register_head_debias_projection_hook(
+                        l,
+                        h,
+                        torch.from_numpy(white_emb[(l, h)]).float(),
+                        torch.from_numpy(black_emb[(l, h)]).float(),
+                        None,
+                        pos,
+                        args.intervention_strength,
+                        num_heads,
+                        head_dim,
+                        use_std=False,
+                    )
+                )
         try:
             with torch.no_grad():
                 out = model(input_ids=ids, attention_mask=mask)

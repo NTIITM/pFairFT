@@ -17,16 +17,15 @@ from tqdm import tqdm
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'src'))
 
-from prompt import add_yes_no_instruction, build_category_prompt, format_prompt_for_model, resolve_model_type
-from probability import YES_CANDIDATES, NO_CANDIDATES, get_target_token_ids, compute_p_yes_batch
+from prompt import add_yes_no_instruction, build_resume_prompt, format_prompt_for_model, resolve_model_type
+from probability import YES_CANDIDATES, NO_CANDIDATES, get_target_token_ids
 from util import extract_race_from_query, create_counterfactual_by_race, get_input_device
 from sampling import load_samples_by_csv_indices
 from hook import (
-    make_intervention_hook_debias_projection,
     remove_intervention_hooks,
-    create_config_detection_hook,
 )
 from util import get_model_config
+from model_adapter import get_model_adapter
 
 
 def _load_resume_samples_by_csv_indices(
@@ -48,12 +47,12 @@ def _load_resume_samples_by_csv_indices(
     return sampled_data
 
 
-def _detect_head_config(model, tokenizer, input_device, model_type: str, any_prompt: str) -> Tuple[int, int]:
+def _detect_head_config(model, adapter, tokenizer, input_device, model_type: str, any_prompt: str) -> Tuple[int, int]:
     cfg = get_model_config(model)
     num_heads, head_dim = int(cfg["num_heads"]), int(cfg["head_dim"])
 
     temp: Dict[str, object] = {}
-    hook = model.model.layers[0].self_attn.o_proj.register_forward_hook(create_config_detection_hook(temp))
+    hook = adapter.register_config_detection_hook(temp)
     try:
         test_inputs = tokenizer(
             [format_prompt_for_model(any_prompt, model_type)],
@@ -81,7 +80,8 @@ def main() -> None:
     parser.add_argument("--biased_csv_path", type=str, required=True)
     parser.add_argument("--sample_size", type=int, default=100)
     parser.add_argument("--output_csv_path", type=str, required=True)
-    parser.add_argument("--model_type", type=str, default="auto", choices=["auto", "llama", "qwen", "deepseek"])
+    parser.add_argument("--model_type", type=str, default="auto", choices=["auto", "llama", "qwen", "deepseek", "olmoe", "jetmoe"])
+    parser.add_argument("--resume_prompt_mode", choices=["summary_only", "category"], default="summary_only")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--sensitive_heads_dir", type=str, default="")
     parser.add_argument("--intervention_mode", type=str, choices=["all", "partial"], default="all")
@@ -117,7 +117,7 @@ def main() -> None:
         orig_index = int(item.get("_orig_index", item.get("ID", 0)))
         indices.append(orig_index)
 
-        base_query = build_category_prompt(summary, category)
+        base_query = build_resume_prompt(summary, category, mode=args.resume_prompt_mode)
         extracted_race = extract_race_from_query(base_query) or race or "Unknown"
 
         fact_item = {
@@ -153,6 +153,8 @@ def main() -> None:
 
     input_device = get_input_device(model, args.device)
     model_type = resolve_model_type(args.model_type, model=model, tokenizer=tokenizer, model_path=args.base_model_path)
+    adapter = get_model_adapter(model, model_type=args.model_type, model_path=args.base_model_path)
+    print(f"Using adapter: {adapter.family} ({adapter.head_activation_kind})")
 
     yes_ids = get_target_token_ids(tokenizer, YES_CANDIDATES)
     no_ids = get_target_token_ids(tokenizer, NO_CANDIDATES)
@@ -192,7 +194,7 @@ def main() -> None:
         target_heads = list(white_emb.keys())
 
     any_prompt = fact_prompts_raw[0]
-    num_heads, head_dim = _detect_head_config(model, tokenizer, input_device, model_type, any_prompt)
+    num_heads, head_dim = _detect_head_config(model, adapter, tokenizer, input_device, model_type, any_prompt)
 
     # compute p(yes) for fact/cf with per-sample forward hooks (because exp25 intervention)
     def _compute_with_intervention(prompts: List[str], desc: str) -> List[float]:
@@ -211,36 +213,25 @@ def main() -> None:
                     continue
                 w = torch.from_numpy(white_emb[(l, h)]).float()
                 b = torch.from_numpy(black_emb[(l, h)]).float()
-                hook_fn = make_intervention_hook_debias_projection(
-                    l,
-                    h,
-                    w,
-                    b,
-                    None,
-                    out_pos,
-                    args.intervention_strength,
-                    num_heads,
-                    head_dim,
-                    use_std=False,
+                hooks.append(
+                    adapter.register_head_debias_projection_hook(
+                        l,
+                        h,
+                        w,
+                        b,
+                        None,
+                        out_pos,
+                        args.intervention_strength,
+                        num_heads,
+                        head_dim,
+                        use_std=False,
+                    )
                 )
-                hooks.append(model.model.layers[l].self_attn.o_proj.register_forward_pre_hook(hook_fn))
 
             try:
                 with torch.no_grad():
                     outputs = model(input_ids=input_ids, attention_mask=attention_mask)
                     logits_row = outputs.logits[0, out_pos, :].float()
-                    # Reuse batch helper for single prompt to avoid duplicating logic
-                    p = compute_p_yes_batch(
-                        model=None,
-                        tokenizer=tokenizer,
-                        prompts=[],
-                        device=str(input_device),
-                        yes_ids=yes_ids,
-                        no_ids=no_ids,
-                        model_type=model_type,
-                    )
-                    # Above call is not usable without model; compute directly
-                    # Do direct compute like discrim-eval code path
                     from util import compute_p_yes_from_logits_with_warning
 
                     p_yes = compute_p_yes_from_logits_with_warning(

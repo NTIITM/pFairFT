@@ -47,49 +47,15 @@ from util import (  # type: ignore  # noqa: E402
     get_model_config,
     extract_race_from_query,
 )
-from sampling import sample_resume_data_by_race  # type: ignore  # noqa: E402
+from sampling import (  # type: ignore  # noqa: E402
+    load_samples_by_csv_indices,
+    sample_resume_data_by_race,
+)
 from hook import (  # type: ignore  # noqa: E402
     get_last_token_indices_safe,
     remove_intervention_hooks,
 )
-
-
-def make_mlp_mean_replacement_hook(
-    layer_idx: int,
-    mean_embedding: torch.Tensor,
-    output_pos: int,
-):
-    """用于 Resume 任务的统一 mean ablation MLP hook。
-
-    挂载位置：model.model.layers[layer_idx].mlp
-    干预逻辑：在 output_pos 位置，将该层 MLP 输出替换为 mean_embedding。
-    """
-    mean_embedding = mean_embedding.to(dtype=torch.float32)
-
-    def hook(module, inputs, output):
-        if not isinstance(output, torch.Tensor):
-            raise ValueError(
-                f"MLP hook at layer {layer_idx}: expected Tensor output, got {type(output)}"
-            )
-        out = output.clone()
-        bsz, seqlen, hidden_dim = out.shape
-        if output_pos >= seqlen:
-            return out
-
-        device = out.device
-        mean_vec = mean_embedding.to(device=device, dtype=out.dtype)
-        if mean_vec.shape[0] != hidden_dim:
-            if mean_vec.shape[0] > hidden_dim:
-                mean_vec = mean_vec[:hidden_dim]
-            else:
-                padded = torch.zeros(hidden_dim, dtype=mean_vec.dtype, device=mean_vec.device)
-                padded[: mean_vec.shape[0]] = mean_vec
-                mean_vec = padded
-
-        out[:, output_pos, :] = mean_vec.unsqueeze(0).expand(bsz, -1)
-        return out
-
-    return hook
+from model_adapter import get_model_adapter  # type: ignore  # noqa: E402
 
 
 def main() -> None:
@@ -112,7 +78,7 @@ def main() -> None:
         "--model_type",
         type=str,
         default="auto",
-        choices=["auto", "llama", "qwen", "deepseek"],
+        choices=["auto", "llama", "qwen", "deepseek", "olmoe", "jetmoe"],
     )
     parser.add_argument(
         "--device",
@@ -128,7 +94,12 @@ def main() -> None:
         "--csv_path",
         type=str,
         default="",
-        help="Path to append per-sample intervention results CSV.",
+        help="Path to write per-sample intervention results CSV.",
+    )
+    parser.add_argument(
+        "--append_csv",
+        action="store_true",
+        help="Append to --csv_path instead of replacing it.",
     )
     parser.add_argument(
         "--sensitive_mlp_path",
@@ -146,6 +117,13 @@ def main() -> None:
         "--max_samples",
         type=int,
         default=500,
+    )
+    parser.add_argument("--sample_csv_path", type=str, default="")
+    parser.add_argument("--sample_size", type=int, default=0)
+    parser.add_argument(
+        "--resume_prompt_mode",
+        choices=["summary_only", "category"],
+        default="summary_only",
     )
     parser.add_argument(
         "--balanced",
@@ -182,23 +160,32 @@ def main() -> None:
     if not isinstance(dataset, list):
         raise ValueError("Dataset should be a list of records.")
 
-    sampled_data = sample_resume_data_by_race(
-        data_records=dataset,
-        max_samples=args.max_samples,
-        balanced=args.balanced,
-        random_sampling=args.random_sampling,
-        seed=args.seed,
-    )
+    if args.sample_csv_path:
+        sampled_data, used_indices, _ = load_samples_by_csv_indices(
+            dataset=dataset,
+            csv_path=args.sample_csv_path,
+            sample_size=args.sample_size,
+        )
+    else:
+        sampled_data = sample_resume_data_by_race(
+            data_records=dataset,
+            max_samples=args.max_samples,
+            balanced=args.balanced,
+            random_sampling=args.random_sampling,
+            seed=args.seed,
+        )
+        index_by_identity = {id(item): idx for idx, item in enumerate(dataset)}
+        used_indices = [index_by_identity[id(item)] for item in sampled_data]
 
     fact_data: List[dict] = []
-    for idx, item in enumerate(sampled_data):
+    for original_index, item in zip(used_indices, sampled_data):
         summary = item.get("summary", "")
         category = item.get("category", "")
         race = item.get("race", "")
         query = summary
         fact_data.append(
             {
-                "id": idx,
+                "id": int(original_index),
                 "query": query,
                 "summary": summary,
                 "category": category,
@@ -234,6 +221,8 @@ def main() -> None:
         model_path=args.model_path,
     )
     print(f"Using model_type: {model_type}")
+    adapter = get_model_adapter(model, model_type=args.model_type, model_path=args.model_path)
+    print(f"Using adapter: {adapter.family} ({adapter.head_activation_kind})")
 
     # 3. Token IDs
     yes_ids = get_target_token_ids(tokenizer, YES_CANDIDATES)
@@ -287,7 +276,11 @@ def main() -> None:
         races.append(race)
         cat = item.get("category", "")
         categories.append(cat)
-        prompt = build_category_prompt(q, cat)
+        prompt = (
+            q
+            if args.resume_prompt_mode == "summary_only"
+            else build_category_prompt(q, cat)
+        )
         prompt = add_yes_no_instruction(prompt)
         prompts.append(prompt)
 
@@ -308,19 +301,17 @@ def main() -> None:
 
         prompt_hooks = []
         for l in sensitive_layers:
-            target_module = model.model.layers[l].mlp
             mean_emb_np = (white_emb[l] + black_emb[l]) / 2.0
             mean_emb = (
                 torch.from_numpy(mean_emb_np).float()
                 if isinstance(mean_emb_np, np.ndarray)
                 else mean_emb_np
             )
-            hook_fn = make_mlp_mean_replacement_hook(
+            hook = adapter.register_mlp_mean_replacement_hook(
                 layer_idx=l,
                 mean_embedding=mean_emb,
                 output_pos=output_pos,
             )
-            hook = target_module.register_forward_hook(hook_fn)
             prompt_hooks.append(hook)
 
         try:
@@ -345,11 +336,12 @@ def main() -> None:
 
     # 7. Save CSV
     if args.csv_path:
-        file_exists = os.path.exists(args.csv_path)
         os.makedirs(os.path.dirname(args.csv_path) or ".", exist_ok=True)
-        with open(args.csv_path, "a", newline="", encoding="utf-8") as f:
+        mode = "a" if args.append_csv else "w"
+        write_header = not args.append_csv or not os.path.exists(args.csv_path)
+        with open(args.csv_path, mode, newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            if not file_exists:
+            if write_header:
                 writer.writerow([
                     "sample_id",
                     "model",
@@ -370,6 +362,27 @@ def main() -> None:
                     float(p_yes),
                     args.intervention_type,
                 ])
+
+    metadata = {
+        "model_path": args.model_path,
+        "model_type": model_type,
+        "adapter_family": adapter.family,
+        "head_activation_kind": adapter.head_activation_kind,
+        "mlp_surface": "routed_moe_block_output",
+        "dataset": "resume",
+        "dataset_json_path": args.dataset_json_path,
+        "sample_csv_path": args.sample_csv_path or None,
+        "sample_size": len(fact_data),
+        "sample_indices": [int(index) for index in used_indices],
+        "resume_prompt_mode": args.resume_prompt_mode,
+        "sensitive_mlp_path": args.sensitive_mlp_path,
+        "mlp_embeddings_path": args.mlp_embeddings_path,
+        "selected_layers": sensitive_layers,
+        "intervention_type": args.intervention_type,
+        "csv_path": args.csv_path or None,
+    }
+    with open(os.path.join(args.output_dir, "metadata.json"), "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
 
     print("Done. Total samples:", len(fact_data))
 

@@ -49,10 +49,9 @@ from util import extract_race_from_query, create_counterfactual_by_race, get_mod
 from sampling import load_samples_by_csv_indices
 from hook import (
     get_last_token_indices_safe,
-    get_activation_hook_for_intervention,
-    create_config_detection_hook,
     remove_intervention_hooks,
 )
+from model_adapter import get_model_adapter
 
 
 class ResumeInterventionDataset(Dataset):
@@ -125,7 +124,7 @@ def _load_sensitive_mlp_layers(selected_mlp_json: str, num_layers: int) -> List[
     return out
 
 
-def make_mlp_input_to_output_replacement_hook(layer_idx: int, output_pos: int):
+def make_mlp_input_to_output_replacement_hook(layer_idx: int, output_pos):
     """Same as exp15/evaluate_intervention_MLP_resume.py."""
 
     def hook(module, inputs, output):
@@ -146,11 +145,16 @@ def make_mlp_input_to_output_replacement_hook(layer_idx: int, output_pos: int):
                 f"MLP hook at layer {layer_idx}: expected 3D tensors, got inp={inp.shape}, out={out.shape}"
             )
 
-        if output_pos >= out.shape[1]:
-            return out
-
-        inp_vec = inp[:, output_pos, :].to(dtype=out.dtype, device=out.device)
-        out[:, output_pos, :] = inp_vec
+        if torch.is_tensor(output_pos):
+            rows = torch.arange(out.shape[0], device=out.device)
+            positions = output_pos.to(out.device).clamp(min=0, max=out.shape[1] - 1)
+            inp_vec = inp[rows.to(inp.device), positions.to(inp.device), :].to(
+                dtype=out.dtype, device=out.device
+            )
+            out[rows, positions, :] = inp_vec
+        elif int(output_pos) < out.shape[1]:
+            inp_vec = inp[:, int(output_pos), :].to(dtype=out.dtype, device=out.device)
+            out[:, int(output_pos), :] = inp_vec
         return out
 
     return hook
@@ -158,6 +162,7 @@ def make_mlp_input_to_output_replacement_hook(layer_idx: int, output_pos: int):
 
 def _run_with_mlp_intervention_collect_acts(
     model,
+    adapter,
     tokenizer,
     model_type: str,
     device: torch.device,
@@ -174,12 +179,15 @@ def _run_with_mlp_intervention_collect_acts(
     """
     batch_activations_buffer: Dict[int, torch.Tensor] = {}
 
-    # head activation hooks on all layers' o_proj
     hooks = []
     for l in range(num_layers):
-        layer_module = model.model.layers[l].self_attn.o_proj
-        hook_fn = get_activation_hook_for_intervention(l, num_heads, head_dim, batch_activations_buffer)
-        hooks.append(layer_module.register_forward_hook(hook_fn))
+        hooks.append(
+            adapter.register_head_activation_hook(
+                l, num_heads, head_dim, batch_activations_buffer
+            )
+        )
+
+    input_device = adapter.get_input_embedding_module().weight.device
 
     acts: Dict[Tuple[int, int], List[np.ndarray]] = {}
 
@@ -191,17 +199,17 @@ def _run_with_mlp_intervention_collect_acts(
             padding=True,
             truncation=True,
             add_special_tokens=False,
-        ).to(device)
+        ).to(input_device)
         attention_mask = inputs.get("attention_mask", torch.ones_like(inputs["input_ids"]))
         last_token_indices = get_last_token_indices_safe(inputs["input_ids"], attention_mask, tokenizer)
-        batch_range = torch.arange(inputs["input_ids"].shape[0], device=device)
-
-        output_pos = int(last_token_indices[0].item())
+        batch_range = torch.arange(inputs["input_ids"].shape[0], device=input_device)
 
         prompt_hooks = []
         for l in sensitive_layers:
-            target_module = model.model.layers[l].mlp
-            hook_fn = make_mlp_input_to_output_replacement_hook(layer_idx=l, output_pos=output_pos)
+            target_module = adapter.get_mlp_module(l)
+            hook_fn = make_mlp_input_to_output_replacement_hook(
+                layer_idx=l, output_pos=last_token_indices
+            )
             prompt_hooks.append(target_module.register_forward_hook(hook_fn))
 
         batch_activations_buffer.clear()
@@ -273,7 +281,7 @@ def main() -> None:
         "--model_type",
         type=str,
         default="auto",
-        choices=["auto", "llama", "qwen", "deepseek"],
+        choices=["auto", "llama", "qwen", "deepseek", "olmoe", "jetmoe"],
     )
     parser.add_argument(
         "--mlp_selected_path",
@@ -313,6 +321,8 @@ def main() -> None:
         args.model_type, model=model, tokenizer=tokenizer, model_path=args.model_path
     )
     print(f"Using model_type: {model_type}")
+    adapter = get_model_adapter(model, model_type=args.model_type, model_path=args.model_path)
+    print(f"Using adapter: {adapter.family} ({adapter.head_activation_kind})")
 
     device = torch.device(args.device)
 
@@ -328,8 +338,7 @@ def main() -> None:
     # Detect actual head config if needed
     print("Detecting actual head config via a single forward...")
     temp_buf: Dict[str, int] = {}
-    detect_hook_fn = create_config_detection_hook(temp_buf)
-    temp_hook = model.model.layers[0].self_attn.o_proj.register_forward_hook(detect_hook_fn)
+    temp_hook = adapter.register_config_detection_hook(temp_buf)
 
     sampled_data = _load_resume_topk_by_csv(
         args.dataset_json_path, args.biased_csv_path, args.sample_size
@@ -394,6 +403,7 @@ def main() -> None:
     # Collect head activations under intervention, for fact and cf
     fact_acts = _run_with_mlp_intervention_collect_acts(
         model=model,
+        adapter=adapter,
         tokenizer=tokenizer,
         model_type=model_type,
         device=device,
@@ -406,6 +416,7 @@ def main() -> None:
     )
     cf_acts = _run_with_mlp_intervention_collect_acts(
         model=model,
+        adapter=adapter,
         tokenizer=tokenizer,
         model_type=model_type,
         device=device,
@@ -425,37 +436,25 @@ def main() -> None:
     mean_diff_p_yes_mlp = np.zeros((num_layers, num_heads), dtype=np.float64)
 
     for l in range(num_layers):
-        o_proj = model.model.layers[l].self_attn.o_proj
-        o_proj_weight = o_proj.weight
-        o_proj_device = next(o_proj.parameters()).device
-        o_proj_dtype = o_proj_weight.dtype
-
-        w_u_on_device = model.lm_head.weight.to(device=o_proj_device, dtype=o_proj_dtype)
-
-        cand_ids = torch.tensor(cand_ids_list, dtype=torch.long, device=o_proj_device)
-        yes_mask = torch.tensor(
-            [int(tok_id in yes_ids_set) for tok_id in cand_ids_list],
-            dtype=torch.bool,
-            device=o_proj_device,
-        )
-
         for h in range(num_heads):
             key = (l, h)
             if key not in fact_acts or key not in cf_acts:
                 continue
 
-            fact_hd = torch.from_numpy(fact_acts[key]).to(device=o_proj_device, dtype=o_proj_dtype)
-            cf_hd = torch.from_numpy(cf_acts[key]).to(device=o_proj_device, dtype=o_proj_dtype)
-
-            start_idx = h * head_dim
-            end_idx = (h + 1) * head_dim
-            o_slice = o_proj_weight[:, start_idx:end_idx]
-
-            fact_hidden = fact_hd @ o_slice.t()
-            cf_hidden = cf_hd @ o_slice.t()
-
-            fact_logits = fact_hidden @ w_u_on_device.t()
-            cf_logits = cf_hidden @ w_u_on_device.t()
+            fact_hd = torch.from_numpy(fact_acts[key])
+            cf_hd = torch.from_numpy(cf_acts[key])
+            fact_logits = adapter.project_head_activations_to_logits(
+                l, h, fact_hd, num_heads, head_dim
+            )
+            cf_logits = adapter.project_head_activations_to_logits(
+                l, h, cf_hd, num_heads, head_dim
+            )
+            cand_ids = torch.tensor(cand_ids_list, dtype=torch.long, device=fact_logits.device)
+            yes_mask = torch.tensor(
+                [int(tok_id in yes_ids_set) for tok_id in cand_ids_list],
+                dtype=torch.bool,
+                device=fact_logits.device,
+            )
 
             fact_cand_probs = torch.softmax((fact_logits[:, cand_ids]).float(), dim=-1)
             cf_cand_probs = torch.softmax((cf_logits[:, cand_ids]).float(), dim=-1)
@@ -495,6 +494,8 @@ def main() -> None:
         "sensitive_layers": sensitive_layers,
         "elbow_score": elbow_score,
         "cand_ids_count": len(cand_ids_list),
+        "adapter_family": adapter.family,
+        "head_activation_kind": adapter.head_activation_kind,
     }
     with open(os.path.join(args.output_dir, "summary_mlp.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)

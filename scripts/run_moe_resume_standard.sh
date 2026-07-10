@@ -43,13 +43,13 @@ PFAIRFT_KL_CE_DIR="$RESULTS_ROOT/pfairft_fairness_kl_ce_summary_only_current_ran
 
 RESUME_BASE="$DOWNSTREAM_DIR/resume_baseline_top100_summary_only_current_ranking_fresh.csv"
 RESUME_GLOBAL="$DOWNSTREAM_DIR/resume_global_lora_ce_summary_only_current_ranking_full_fresh.csv"
-RESUME_PFAIRFT="$DOWNSTREAM_DIR/resume_pfairft_summary_only_current_ranking_full_fresh.csv"
+RESUME_PFAIRFT="$DOWNSTREAM_DIR/resume_pfairft_ce_summary_only_current_ranking_full_fresh.csv"
 RESUME_PFAIRFT_KL="$DOWNSTREAM_DIR/resume_pfairft_kl_summary_only_current_ranking_full_fresh.csv"
 RESUME_PFAIRFT_KL_CE="$DOWNSTREAM_DIR/resume_pfairft_kl_ce_summary_only_current_ranking_full_fresh.csv"
 
 DISCRIM_BASE="$DOWNSTREAM_DIR/discrim_baseline_resume_standard_fresh.csv"
 DISCRIM_GLOBAL="$DOWNSTREAM_DIR/discrim_global_lora_ce_resume_standard_fresh.csv"
-DISCRIM_PFAIRFT="$DOWNSTREAM_DIR/discrim_pfairft_resume_standard_fresh.csv"
+DISCRIM_PFAIRFT="$DOWNSTREAM_DIR/discrim_pfairft_ce_resume_standard_fresh.csv"
 DISCRIM_PFAIRFT_KL="$DOWNSTREAM_DIR/discrim_pfairft_kl_resume_standard_fresh.csv"
 DISCRIM_PFAIRFT_KL_CE="$DOWNSTREAM_DIR/discrim_pfairft_kl_ce_resume_standard_fresh.csv"
 
@@ -279,4 +279,3 @@ if [[ "$RUN_PLOTS" == "1" ]]; then
     --out_pdf "$DISCRIM_FIG_PDF" \
     --model_label "$MODEL_LABEL"
 fi
-

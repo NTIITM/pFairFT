@@ -21,12 +21,11 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'src'))
 
 from hook import (
-    make_intervention_hook_debias_projection,
     remove_intervention_hooks,
-    create_config_detection_hook,
 )
 from util import get_model_config, get_input_device
 from prompt import format_prompt_for_model, resolve_model_type
+from model_adapter import get_model_adapter
 
 CHOICE_LETTERS = ["A", "B", "C", "D"]
 
@@ -40,7 +39,7 @@ def build_mmlu_prompt(question: str, choices: List[str]) -> str:
     return prompt
 
 def get_choice_logit_with_intervention(
-    model, tokenizer, prompt, choice_letter, device, 
+    model, adapter, tokenizer, prompt, choice_letter, device,
     intervention_mode, target_heads, white_emb, black_emb, num_heads, head_dim, intervention_strength, model_type
 ) -> float:
     inputs = tokenizer(prompt, return_tensors="pt")
@@ -53,10 +52,20 @@ def get_choice_logit_with_intervention(
             if (l, h) in white_emb and (l, h) in black_emb:
                 w = torch.from_numpy(white_emb[(l, h)]).float()
                 b = torch.from_numpy(black_emb[(l, h)]).float()
-                hook_fn = make_intervention_hook_debias_projection(
-                    l, h, w, b, None, out_pos, intervention_strength, num_heads, head_dim
+                hooks.append(
+                    adapter.register_head_debias_projection_hook(
+                        l,
+                        h,
+                        w,
+                        b,
+                        None,
+                        out_pos,
+                        intervention_strength,
+                        num_heads,
+                        head_dim,
+                        use_std=False,
+                    )
                 )
-                hooks.append(model.model.layers[l].self_attn.o_proj.register_forward_pre_hook(hook_fn))
     
     try:
         with torch.no_grad():
@@ -84,6 +93,9 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(args.model_path, torch_dtype=torch.float16, device_map="auto", trust_remote_code=True)
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     model_type = resolve_model_type("auto", model=model, tokenizer=tokenizer, model_path=args.model_path)
+    adapter = get_model_adapter(model, model_type="auto", model_path=args.model_path)
+    device = adapter.get_input_embedding_module().weight.device
+    print(f"Using adapter: {adapter.family} ({adapter.head_activation_kind})")
 
     # Intervention Config
     target_heads, white_emb, black_emb = [], {}, {}
@@ -112,12 +124,12 @@ def main():
     correct = 0
     for idx, row in enumerate(tqdm(dataset, desc=f"MMLU {args.intervention_mode}")):
         prompt = format_prompt_for_model(build_mmlu_prompt(row["question"], row["choices"]), model_type)
-        logits = [get_choice_logit_with_intervention(model, tokenizer, prompt, L, device, args.intervention_mode, target_heads, white_emb, black_emb, num_heads, head_dim, args.intervention_strength, model_type) for L in CHOICE_LETTERS]
+        logits = [get_choice_logit_with_intervention(model, adapter, tokenizer, prompt, L, device, args.intervention_mode, target_heads, white_emb, black_emb, num_heads, head_dim, args.intervention_strength, model_type) for L in CHOICE_LETTERS]
         if np.argmax(logits) == row["answer"]: correct += 1
 
     acc = correct / len(dataset)
     with open(args.output_json, "w") as f:
-        json.dump({"model": args.model_path, "mode": args.intervention_mode, "accuracy": acc, "total": len(dataset)}, f, indent=2)
+        json.dump({"model": args.model_path, "mode": args.intervention_mode, "accuracy": acc, "total": len(dataset), "adapter_family": adapter.family, "head_activation_kind": adapter.head_activation_kind}, f, indent=2)
     print(f"Accuracy: {acc:.4f}")
 
 if __name__ == "__main__": main()

@@ -47,9 +47,9 @@ from util import (
 from sampling import sample_resume_data_by_race, load_samples_by_csv_indices
 from hook import (
     get_last_token_indices_safe,
-    make_intervention_hook_mean_replacement,
     remove_intervention_hooks,
 )
+from model_adapter import get_model_adapter
 
 
 def _race_to_group(race: str) -> Optional[int]:
@@ -66,6 +66,7 @@ def _race_to_group(race: str) -> Optional[int]:
 
 def compute_p_yes_with_intervention(
     model,
+    adapter,
     tokenizer,
     prompt: str,
     model_type: str,
@@ -94,7 +95,6 @@ def compute_p_yes_with_intervention(
         if (l, h) not in white_emb or (l, h) not in black_emb:
             continue
 
-        target_module = model.model.layers[l].self_attn.o_proj
         # 负向干预：mean ablation
         mean_emb_np = (white_emb[(l, h)] + black_emb[(l, h)]) / 2.0
         mean_emb = (
@@ -102,10 +102,9 @@ def compute_p_yes_with_intervention(
             if isinstance(mean_emb_np, np.ndarray)
             else mean_emb_np
         )
-        hook_fn = make_intervention_hook_mean_replacement(
+        hook = adapter.register_head_mean_replacement_hook(
             l, h, mean_emb, output_pos, num_heads, head_dim
         )
-        hook = target_module.register_forward_pre_hook(hook_fn)
         prompt_hooks.append(hook)
 
     try:
@@ -152,6 +151,11 @@ def main():
         type=str,
         default="/home/common1/hwluo/project/pFairFT/data/resume/qwen_summaries_with_race.json",
         help="Path to the dataset JSON file.",
+    )
+    parser.add_argument(
+        "--resume_prompt_mode",
+        choices=["summary_only", "category"],
+        default="summary_only",
     )
     parser.add_argument(
         "--output_dir",
@@ -257,6 +261,8 @@ def main():
 
     model_type = resolve_model_type(args.model_type, model=model, tokenizer=tokenizer, model_path=args.model_path)
     print(f"Using model_type: {model_type}")
+    adapter = get_model_adapter(model, model_type=args.model_type, model_path=args.model_path)
+    print(f"Using adapter: {adapter.family} ({adapter.head_activation_kind})")
 
     yes_ids = get_target_token_ids(tokenizer, YES_CANDIDATES)
     no_ids = get_target_token_ids(tokenizer, NO_CANDIDATES)
@@ -311,10 +317,14 @@ def main():
         category = item.get("category", "")
         race_str = item.get("race", "")
 
-        if not summary or not category:
+        if not summary or (args.resume_prompt_mode == "category" and not category):
             continue
 
-        query = build_category_prompt(summary, category)
+        query = (
+            summary
+            if args.resume_prompt_mode == "summary_only"
+            else build_category_prompt(summary, category)
+        )
 
         extracted_race = extract_race_from_query(query)
         if extracted_race is None:
@@ -453,10 +463,11 @@ def main():
     # 生成要测试的头数量列表（0, 5, 10, 15, ..., 不超过 non_sensitive_heads 数量）
     max_n = min(args.max_head_count, len(non_sensitive_heads))
     head_counts = list(range(0, max_n + 1, args.step))
-    if max_n > 0 and (max_n < args.step or 0 not in head_counts):
-        head_counts = [0] + [c for c in head_counts if c > 0]
+    if max_n not in head_counts:
+        head_counts.append(max_n)
     head_counts = sorted(set(head_counts))
     print(f"Will test head counts (random heads, negative intervention): {head_counts}")
+    selected_heads_by_count: Dict[str, List[List[int]]] = {}
 
     # 准备CSV输出
     csv_path = os.path.join(args.output_dir, args.results_csv_name)
@@ -480,6 +491,7 @@ def main():
 
         # 从非敏感头中随机选取 head_count 个头（与 exp8 negative_random 一致）
         current_heads = random.sample(non_sensitive_heads, head_count) if head_count > 0 else []
+        selected_heads_by_count[str(head_count)] = [list(head) for head in current_heads]
         if head_count == 0:
             print("Using baseline (no intervention)")
         else:
@@ -551,6 +563,7 @@ def main():
                 # 计算事实概率（带负向干预）
                 fact_p_yes = compute_p_yes_with_intervention(
                     model=model,
+                    adapter=adapter,
                     tokenizer=tokenizer,
                     prompt=fact_item["query"],
                     model_type=model_type,
@@ -577,6 +590,7 @@ def main():
                 
                 cf_p_yes = compute_p_yes_with_intervention(
                     model=model,
+                    adapter=adapter,
                     tokenizer=tokenizer,
                     prompt=cf_item["query"],
                     model_type=model_type,
@@ -607,6 +621,24 @@ def main():
 
 
     csv_file.close()
+    metadata = {
+        "experiment": "resume_head_count_random",
+        "model_path": args.model_path,
+        "model_type": model_type,
+        "adapter_family": adapter.family,
+        "head_activation_kind": adapter.head_activation_kind,
+        "dataset_json_path": args.dataset_json_path,
+        "sample_csv_path": args.sample_csv_path,
+        "sample_size": len(samples),
+        "embeddings_path": embeddings_path,
+        "head_counts": head_counts,
+        "selected_heads_by_count": selected_heads_by_count,
+        "seed": args.seed,
+        "resume_prompt_mode": args.resume_prompt_mode,
+        "head_sampling_scope": "non_sensitive_heads_matched_to_topk_count",
+    }
+    with open(os.path.join(args.output_dir, "metadata_random.json"), "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
     print(f"\nSaved results to: {csv_path}")
 
     print("\n" + "=" * 60)

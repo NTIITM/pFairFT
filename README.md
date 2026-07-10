@@ -34,6 +34,31 @@ The driver defaults to `DRY_RUN=1`. Set `DRY_RUN=0` to execute, and use `RUN_RAN
 LoRA CE, PFairFT, PFairFT-KL, and PFairFT-KL-CE. PFairFT means precise selected heads
 with affine fairness and CE; there is no separate PFairFT-CE branch.
 
+After the standard ranking, head selection, and training artifacts exist, run the
+MOE paper analysis suite with an explicit physical GPU (only 6 or 7 are accepted):
+
+```bash
+MODEL_NAME=JetMoE-8B-Chat \
+MODEL_PATH=/mnt/nfs/huggingface/jetmoe/jetmoe-8b-chat \
+MODEL_TYPE=jetmoe GPU=6 DRY_RUN=0 \
+bash scripts/run_moe_paper_suite.sh
+```
+
+The suite keeps Resume `summary_only` ranking/top-100 data for identification and
+in-domain analysis, and uses Discrim-Eval only for transfer evaluation. Sensitive
+head and random non-sensitive-head controls are stored in separate directories;
+random controls default to five seeds (42-46) and are aggregated with error bands.
+For MOE models, an MLP means the full routed FFN/MOE block output. The exp20 probe
+at layer `l` is the input to layer `l+1`'s MLP/MOE block, with the final point taken
+at the input to the final norm. Both baseline and head-intervened probes use `W_U h`
+without applying the final norm. Router-native, fact-router-frozen, and head-induced
+routing changes are emitted as a separate supplemental analysis.
+
+Use `RUN_HEAD_RESUME`, `RUN_HEAD_DISCRIM_ALL`, `RUN_HEAD_DISCRIM_TOPK`,
+`RUN_ATTENTION`, `RUN_HEAD_LOGIT`, `RUN_MLP`, `RUN_ROUTER`, `RUN_PROMPT_HEAD`,
+`RUN_INFERENCE_TIME`, `RUN_FIGURE8`, and `RUN_A13` to select paper-suite phases.
+The paper suite also defaults to `DRY_RUN=1`.
+
 The method is wrapped into OOP classes in `src`. To utilize the main methodologies, simply import the target module:
 
 ```python

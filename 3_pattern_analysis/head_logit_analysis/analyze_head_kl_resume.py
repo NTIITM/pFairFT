@@ -43,9 +43,8 @@ from util import extract_race_from_query, create_counterfactual_by_race, get_mod
 from sampling import load_samples_by_csv_indices
 from hook import (
     get_last_token_indices_safe,
-    get_activation_hook_for_intervention,
-    create_config_detection_hook,
 )
+from model_adapter import get_model_adapter
 
 
 class ResumeInterventionDataset(Dataset):
@@ -121,7 +120,7 @@ def main() -> None:
         "--model_type",
         type=str,
         default="auto",
-        choices=["auto", "llama", "qwen", "deepseek"],
+        choices=["auto", "llama", "qwen", "deepseek", "olmoe", "jetmoe"],
     )
     args = parser.parse_args()
 
@@ -155,6 +154,8 @@ def main() -> None:
         args.model_type, model=model, tokenizer=tokenizer, model_path=args.model_path
     )
     print(f"Using model_type: {model_type}")
+    adapter = get_model_adapter(model, model_type=args.model_type, model_path=args.model_path)
+    print(f"Using adapter: {adapter.family} ({adapter.head_activation_kind})")
 
     device = torch.device(args.device)
 
@@ -170,16 +171,10 @@ def main() -> None:
     cand_ids_list = list(dict.fromkeys(yes_ids + no_ids))  # preserve order, remove dups
     print(f"Total candidate tokens (yes+no): {len(cand_ids_list)}")
 
-    # W_U (lm_head.weight)
-    if not hasattr(model, "lm_head"):
-        raise ValueError("Model has no lm_head.")
-    w_u = model.lm_head.weight  # [V, Hidden]
-
     # Detect actual num_heads/head_dim if needed
     print("Detecting actual head config via a single forward...")
     temp_buf: Dict[str, int] = {}
-    detect_hook_fn = create_config_detection_hook(temp_buf)
-    temp_hook = model.model.layers[0].self_attn.o_proj.register_forward_hook(detect_hook_fn)
+    temp_hook = adapter.register_config_detection_hook(temp_buf)
 
     # Prepare data: load top-K resume samples by CSV index
     print(f"Loading resume top-{args.sample_size} samples by {args.biased_csv_path}")
@@ -249,14 +244,11 @@ def main() -> None:
 
     hooks = []
     for l in range(num_layers):
-        if hasattr(model.model.layers[l].self_attn, "o_proj"):
-            layer_module = model.model.layers[l].self_attn.o_proj
-        else:
-            raise ValueError("Cannot find o_proj")
-        hook_fn = get_activation_hook_for_intervention(
-            l, num_heads, head_dim, batch_activations_buffer
+        hooks.append(
+            adapter.register_head_activation_hook(
+                l, num_heads, head_dim, batch_activations_buffer
+            )
         )
-        hooks.append(layer_module.register_forward_hook(hook_fn))
 
     # We'll store per-layer/head activations as lists of [B, D] and concat later
     fact_acts: Dict[Tuple[int, int], List[np.ndarray]] = {}
@@ -367,46 +359,26 @@ def main() -> None:
     mean_diff_p_yes = np.zeros((num_layers, num_heads), dtype=np.float64)
 
     for l in range(num_layers):
-        o_proj = model.model.layers[l].self_attn.o_proj
-        o_proj_weight = o_proj.weight  # [Hidden, H*D]
-        o_proj_device = next(o_proj.parameters()).device
-        o_proj_dtype = o_proj_weight.dtype
-
-        # Move W_U once per layer to correct device/dtype
-        w_u_on_device = w_u.to(device=o_proj_device, dtype=o_proj_dtype)
-
-        cand_ids = torch.tensor(cand_ids_list, dtype=torch.long, device=o_proj_device)
-        yes_ids_set = set(yes_ids)
-        yes_mask = torch.tensor(
-            [int(tok_id in yes_ids_set) for tok_id in cand_ids_list],
-            dtype=torch.bool,
-            device=o_proj_device,
-        )
-
         for h in range(num_heads):
             key = (l, h)
             if key not in fact_acts or key not in cf_acts:
                 continue
 
-            fact_hd = torch.from_numpy(fact_acts[key]).to(
-                device=o_proj_device, dtype=o_proj_dtype
-            )  # [N, D]
-            cf_hd = torch.from_numpy(cf_acts[key]).to(
-                device=o_proj_device, dtype=o_proj_dtype
-            )  # [N, D]
-
-            # Slice corresponding piece of o_proj: [Hidden, D]
-            start_idx = h * head_dim
-            end_idx = (h + 1) * head_dim
-            o_slice = o_proj_weight[:, start_idx:end_idx]  # [Hidden, D]
-
-            # Project: [N, D] -> [N, Hidden]
-            fact_hidden = fact_hd @ o_slice.t()  # [N, Hidden]
-            cf_hidden = cf_hd @ o_slice.t()      # [N, Hidden]
-
-            # Logits: [N, Hidden] @ [Hidden, V] -> [N, V]
-            fact_logits = fact_hidden @ w_u_on_device.t()  # [N, V]
-            cf_logits = cf_hidden @ w_u_on_device.t()      # [N, V]
+            fact_hd = torch.from_numpy(fact_acts[key])
+            cf_hd = torch.from_numpy(cf_acts[key])
+            fact_logits = adapter.project_head_activations_to_logits(
+                l, h, fact_hd, num_heads, head_dim
+            )
+            cf_logits = adapter.project_head_activations_to_logits(
+                l, h, cf_hd, num_heads, head_dim
+            )
+            cand_ids = torch.tensor(cand_ids_list, dtype=torch.long, device=fact_logits.device)
+            yes_ids_set = set(yes_ids)
+            yes_mask = torch.tensor(
+                [int(tok_id in yes_ids_set) for tok_id in cand_ids_list],
+                dtype=torch.bool,
+                device=fact_logits.device,
+            )
 
             # Restrict to candidate set (yes+no) and softmax over candidates
             fact_cand_logits = fact_logits[:, cand_ids]  # [N, K_cand]
@@ -449,6 +421,8 @@ def main() -> None:
         "num_samples": num_samples,
         "yes_ids": yes_ids,
         "no_ids": no_ids,
+        "adapter_family": adapter.family,
+        "head_activation_kind": adapter.head_activation_kind,
     }
     with open(os.path.join(args.output_dir, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)

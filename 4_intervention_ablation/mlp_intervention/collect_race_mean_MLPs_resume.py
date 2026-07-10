@@ -35,15 +35,20 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'src'))
 
 from util import extract_race_from_query, get_model_config  # type: ignore  # noqa: E402
-from sampling import sample_resume_data_by_race  # type: ignore  # noqa: E402
+from sampling import (  # type: ignore  # noqa: E402
+    load_samples_by_csv_indices,
+    sample_resume_data_by_race,
+)
 from prompt import format_prompt_for_model, resolve_model_type, add_yes_no_instruction, build_category_prompt# type: ignore  # noqa: E402
 from hook import get_last_token_indices_safe, get_mlp_last_token_activation_hook  # type: ignore  # noqa: E402
 from cache import MLPDiskCache  # type: ignore  # noqa: E402
+from model_adapter import get_model_adapter  # type: ignore  # noqa: E402
 
 
 class ResumeDataset(Dataset):
-    def __init__(self, data_records: List[dict]):
+    def __init__(self, data_records: List[dict], resume_prompt_mode: str):
         self.data = data_records
+        self.resume_prompt_mode = resume_prompt_mode
 
     def __len__(self) -> int:
         return len(self.data)
@@ -55,9 +60,14 @@ class ResumeDataset(Dataset):
         category = item.get("category", "")
         if not race:
             race = extract_race_from_query(query) or "Unknown"
+        query = (
+            query
+            if self.resume_prompt_mode == "summary_only"
+            else build_category_prompt(query, category)
+        )
         return {
             "index": idx,
-            "prompt": add_yes_no_instruction(build_category_prompt(query, category)),
+            "prompt": add_yes_no_instruction(query),
             "race": race if race else "Unknown",
         }
 
@@ -72,6 +82,23 @@ def main() -> None:
     )
     parser.add_argument("--output_path", type=str, required=True)
     parser.add_argument("--max_samples", type=int, default=500)
+    parser.add_argument(
+        "--sample_csv_path",
+        type=str,
+        default="",
+        help="Follow the ranking CSV index order instead of sampling the dataset.",
+    )
+    parser.add_argument(
+        "--sample_size",
+        type=int,
+        default=0,
+        help="Number of ranking rows to use; <=0 uses the full ranking.",
+    )
+    parser.add_argument(
+        "--resume_prompt_mode",
+        choices=["summary_only", "category"],
+        default="summary_only",
+    )
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument(
         "--device",
@@ -82,7 +109,7 @@ def main() -> None:
         "--model_type",
         type=str,
         default="auto",
-        choices=["auto", "llama", "qwen", "deepseek"],
+        choices=["auto", "llama", "qwen", "deepseek", "olmoe", "jetmoe"],
     )
     parser.add_argument("--random_sampling", action="store_true", default=False)
     parser.add_argument("--seed", type=int, default=42)
@@ -123,28 +150,42 @@ def main() -> None:
         hidden_size = config["hidden_size"]
 
         model_type = resolve_model_type(args.model_type, model=model, tokenizer=tokenizer, model_path=args.model_path)
-        device = torch.device(args.device)
+        adapter = get_model_adapter(model, model_type=args.model_type, model_path=args.model_path)
+        print(f"Using adapter: {adapter.family} ({adapter.head_activation_kind})")
+        device = adapter.get_input_embedding_module().weight.device
 
         with open(args.dataset_json_path, "r", encoding="utf-8") as f:
             dataset = json.load(f)
         if not isinstance(dataset, list):
             raise ValueError("Dataset should be a list of records.")
 
-        sampled_data = sample_resume_data_by_race(
-            data_records=dataset,
-            max_samples=args.max_samples,
-            balanced=args.balanced,
-            random_sampling=args.random_sampling,
-            seed=args.seed,
-        )
+        used_indices: List[int]
+        if args.sample_csv_path:
+            sampled_data, used_indices, _ = load_samples_by_csv_indices(
+                dataset=dataset,
+                csv_path=args.sample_csv_path,
+                sample_size=args.sample_size,
+            )
+        else:
+            sampled_data = sample_resume_data_by_race(
+                data_records=dataset,
+                max_samples=args.max_samples,
+                balanced=args.balanced,
+                random_sampling=args.random_sampling,
+                seed=args.seed,
+            )
+            index_by_identity = {id(item): idx for idx, item in enumerate(dataset)}
+            used_indices = [index_by_identity[id(item)] for item in sampled_data]
 
         # Keep only fields we need
         records: List[dict] = []
-        for item in sampled_data:
+        for item, original_index in zip(sampled_data, used_indices):
             records.append(
                 {
                     "summary": item.get("summary", ""),
+                    "category": item.get("category", ""),
                     "race": item.get("race", ""),
+                    "original_index": int(original_index),
                 }
             )
 
@@ -162,15 +203,13 @@ def main() -> None:
         n = len(records)
         cache = MLPDiskCache(n, num_layers, hidden_size, "fact_mlp", temp_dir)
 
-        ds = ResumeDataset(records)
+        ds = ResumeDataset(records, args.resume_prompt_mode)
         dl = DataLoader(ds, batch_size=args.batch_size, shuffle=False)
 
         batch_mlp_buffer: Dict[int, torch.Tensor] = {}
         hooks = []
         for l in range(num_layers):
-            if not hasattr(model.model.layers[l], "mlp"):
-                raise ValueError(f"Layer {l} has no mlp module")
-            hooks.append(model.model.layers[l].mlp.register_forward_hook(get_mlp_last_token_activation_hook(l, batch_mlp_buffer)))
+            hooks.append(adapter.register_mlp_output_hook(l, batch_mlp_buffer))
 
         for batch in tqdm(dl, desc="Collecting MLP activations (resume)"):
             indices = batch["index"].numpy()
@@ -231,6 +270,14 @@ def main() -> None:
             "black_count": int(len(black_indices)),
             "dataset": "resume",
             "model": args.model_path,
+            "adapter_family": adapter.family,
+            "head_activation_kind": adapter.head_activation_kind,
+            "mlp_surface": "routed_moe_block_output",
+            "dataset_json_path": args.dataset_json_path,
+            "sample_csv_path": args.sample_csv_path or None,
+            "sample_size": args.sample_size if args.sample_csv_path else len(records),
+            "sample_indices": used_indices,
+            "resume_prompt_mode": args.resume_prompt_mode,
         }
 
         with open(args.output_path, "wb") as f:

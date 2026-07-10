@@ -17,6 +17,9 @@ from hook import (
     create_config_detection_hook,
     get_activation_hook_for_intervention,
     get_patch_hook_modified,
+    make_intervention_hook_debias_projection,
+    make_intervention_hook_mean_replacement,
+    make_mlp_intervention_hook_mean_replacement,
 )
 
 
@@ -131,6 +134,124 @@ def make_attention_output_patch_hook(
         if isinstance(output, tuple):
             return (new_hidden,) + output[1:]
         return new_hidden
+
+    return hook
+
+
+def make_attention_output_mean_replacement_hook(
+    layer_idx: int,
+    head_idx: int,
+    mean_embedding: torch.Tensor,
+    output_pos: Any,
+    num_heads: int,
+    head_dim: int,
+) -> Callable:
+    """Replace one head slice on an attention module's forward output."""
+    del layer_idx
+    mean_embedding = mean_embedding.detach().to(dtype=torch.float32)
+
+    def hook(module, inputs, output):
+        hidden_state = _extract_first_tensor(output)
+        new_hidden = hidden_state.clone()
+        bsz, seqlen, hidden_dim = new_hidden.shape
+        expected_hidden = num_heads * head_dim
+        if hidden_dim != expected_hidden:
+            if hidden_dim % num_heads != 0:
+                raise ValueError(
+                    f"Expected hidden_dim divisible by num_heads={num_heads}, got {hidden_dim}."
+                )
+            actual_head_dim = hidden_dim // num_heads
+        else:
+            actual_head_dim = head_dim
+
+        replacement = ModelArchitectureAdapter._align_head_dim(
+            mean_embedding.to(device=new_hidden.device, dtype=new_hidden.dtype),
+            actual_head_dim,
+        )
+        heads_view = new_hidden.view(bsz, seqlen, num_heads, actual_head_dim)
+        if torch.is_tensor(output_pos):
+            batch_idxs = torch.arange(bsz, device=new_hidden.device)
+            positions = output_pos.to(new_hidden.device).clamp(min=0, max=seqlen - 1)
+            heads_view[batch_idxs, positions, head_idx, :] = replacement
+        elif int(output_pos) < seqlen:
+            heads_view[:, int(output_pos), head_idx, :] = replacement
+
+        if isinstance(output, tuple):
+            return (new_hidden,) + output[1:]
+        return new_hidden
+
+    return hook
+
+
+def make_attention_output_debias_projection_hook(
+    layer_idx: int,
+    head_idx: int,
+    group1_embedding: torch.Tensor,
+    group2_embedding: torch.Tensor,
+    combined_std: Optional[torch.Tensor],
+    output_pos: Any,
+    intervention_strength: float,
+    num_heads: int,
+    head_dim: int,
+    use_std: bool = True,
+) -> Callable:
+    """Apply affine concept projection to a head slice on module output."""
+    del layer_idx
+    group1 = group1_embedding.detach().float()
+    group2 = group2_embedding.detach().float()
+    direction = group1 - group2
+    if use_std and combined_std is not None:
+        direction = direction / torch.clamp(combined_std.detach().float(), min=1e-10)
+    norm = torch.linalg.vector_norm(direction)
+    if norm > 1e-10:
+        direction = direction / norm
+        bias = 0.5 * (torch.sum(group1 * direction) + torch.sum(group2 * direction))
+    else:
+        direction = torch.zeros_like(direction)
+        bias = torch.tensor(0.0)
+
+    def hook(module, inputs, output):
+        hidden_state = _extract_first_tensor(output)
+        new_hidden = hidden_state.clone()
+        bsz, seqlen, hidden_dim = new_hidden.shape
+        expected_hidden = num_heads * head_dim
+        actual_head_dim = head_dim if hidden_dim == expected_hidden else hidden_dim // num_heads
+        if actual_head_dim * num_heads != hidden_dim:
+            raise ValueError(
+                f"hidden_dim={hidden_dim} is not divisible by num_heads={num_heads}."
+            )
+        heads = new_hidden.view(bsz, seqlen, num_heads, actual_head_dim)
+        d = ModelArchitectureAdapter._align_head_dim(
+            direction.to(device=new_hidden.device, dtype=new_hidden.dtype),
+            actual_head_dim,
+        )
+        b = bias.to(device=new_hidden.device, dtype=new_hidden.dtype)
+        if torch.is_tensor(output_pos):
+            rows = torch.arange(bsz, device=new_hidden.device)
+            positions = output_pos.to(new_hidden.device).clamp(min=0, max=seqlen - 1)
+            values = heads[rows, positions, head_idx, :]
+            projections = torch.sum(values * d, dim=-1, keepdim=True)
+            heads[rows, positions, head_idx, :] = values - intervention_strength * (projections - b) * d
+        elif int(output_pos) < seqlen:
+            values = heads[:, int(output_pos), head_idx, :]
+            projections = torch.sum(values * d, dim=-1, keepdim=True)
+            heads[:, int(output_pos), head_idx, :] = values - intervention_strength * (projections - b) * d
+        if isinstance(output, tuple):
+            return (new_hidden,) + output[1:]
+        return new_hidden
+
+    return hook
+
+
+def make_module_input_capture_hook(
+    key: int,
+    buffer: Dict[int, torch.Tensor],
+) -> Callable:
+    """Capture a module's first input without retaining its autograd graph."""
+
+    def hook(module, inputs):
+        if inputs and torch.is_tensor(inputs[0]):
+            buffer[key] = inputs[0].detach()
 
     return hook
 
@@ -304,6 +425,34 @@ class ModelArchitectureAdapter:
             return attn.o_proj
         raise ValueError(f"Cannot find self_attn.o_proj in layer {layer_idx}.")
 
+    def get_mlp_module(self, layer_idx: int) -> Any:
+        layer = self.get_layers()[layer_idx]
+        for name in ("mlp", "feed_forward", "ffn"):
+            module = getattr(layer, name, None)
+            if module is not None:
+                return module
+        raise ValueError(f"Cannot find MLP/MOE block in layer {layer_idx}.")
+
+    def get_final_norm_module(self) -> Any:
+        lm = self.causal_lm
+        for path in ("model.norm", "transformer.norm_f", "norm"):
+            module = _get_nested_attr(lm, path)
+            if module is not None:
+                return module
+        raise ValueError(f"Cannot find final norm for model type {type(self.model)}")
+
+    def get_input_embedding_module(self) -> Any:
+        lm = self.causal_lm
+        if hasattr(lm, "get_input_embeddings"):
+            module = lm.get_input_embeddings()
+            if module is not None:
+                return module
+        for path in ("model.embed_tokens", "transformer.wte", "embed_tokens"):
+            module = _get_nested_attr(lm, path)
+            if module is not None:
+                return module
+        raise ValueError(f"Cannot find input embeddings for model type {type(self.model)}")
+
     def get_lm_head_weight(self) -> torch.Tensor:
         lm = self.causal_lm
         if hasattr(lm, "lm_head") and hasattr(lm.lm_head, "weight"):
@@ -323,6 +472,26 @@ class ModelArchitectureAdapter:
             if embeddings is not None:
                 return embeddings
         raise ValueError("Cannot find lm_head/output embedding module.")
+
+    def project_residual_to_logits(
+        self,
+        hidden_states: torch.Tensor,
+        apply_final_norm: bool = False,
+    ) -> torch.Tensor:
+        """Apply the model unembedding to a cumulative residual probe."""
+        states = hidden_states
+        if apply_final_norm:
+            norm = self.get_final_norm_module()
+            norm_param = next(norm.parameters(), None)
+            if norm_param is not None and not getattr(norm_param, "is_meta", False):
+                states = states.to(device=norm_param.device, dtype=norm_param.dtype)
+            states = norm(states)
+
+        lm_head = self.get_lm_head_module()
+        weight = getattr(lm_head, "weight", None)
+        if weight is not None and not getattr(weight, "is_meta", False):
+            states = states.to(device=weight.device, dtype=weight.dtype)
+        return lm_head(states)
 
     @staticmethod
     def _align_head_dim(head_activations: torch.Tensor, target_dim: int) -> torch.Tensor:
@@ -419,6 +588,98 @@ class ModelArchitectureAdapter:
             head_idx, fact_layer_tensor, cf_layer_tensor, last_token_indices, num_heads, head_dim
         )
         return module.register_forward_pre_hook(hook_fn)
+
+    def register_head_mean_replacement_hook(
+        self,
+        layer_idx: int,
+        head_idx: int,
+        mean_embedding: torch.Tensor,
+        output_pos: Any,
+        num_heads: int,
+        head_dim: int,
+    ):
+        module = self.get_head_activation_module(layer_idx)
+        hook_fn = make_intervention_hook_mean_replacement(
+            layer_idx,
+            head_idx,
+            mean_embedding,
+            output_pos,
+            num_heads,
+            head_dim,
+        )
+        return module.register_forward_pre_hook(hook_fn)
+
+    def register_head_debias_projection_hook(
+        self,
+        layer_idx: int,
+        head_idx: int,
+        group1_embedding: torch.Tensor,
+        group2_embedding: torch.Tensor,
+        combined_std: Optional[torch.Tensor],
+        output_pos: Any,
+        intervention_strength: float,
+        num_heads: int,
+        head_dim: int,
+        use_std: bool = True,
+    ):
+        module = self.get_head_activation_module(layer_idx)
+        hook_fn = make_intervention_hook_debias_projection(
+            layer_idx,
+            head_idx,
+            group1_embedding,
+            group2_embedding,
+            combined_std,
+            output_pos,
+            intervention_strength,
+            num_heads,
+            head_dim,
+            use_std=use_std,
+        )
+        return module.register_forward_pre_hook(hook_fn)
+
+    def register_mlp_output_hook(
+        self,
+        layer_idx: int,
+        buffer: Dict[int, torch.Tensor],
+    ):
+        def hook(module, inputs, output):
+            buffer[layer_idx] = _extract_first_tensor(output).detach()
+
+        return self.get_mlp_module(layer_idx).register_forward_hook(hook)
+
+    def register_mlp_mean_replacement_hook(
+        self,
+        layer_idx: int,
+        mean_embedding: torch.Tensor,
+        output_pos: Any,
+    ):
+        hook_fn = make_mlp_intervention_hook_mean_replacement(
+            layer_idx,
+            mean_embedding,
+            output_pos,
+        )
+        return self.get_mlp_module(layer_idx).register_forward_hook(hook_fn)
+
+    def register_next_mlp_input_hook(
+        self,
+        layer_idx: int,
+        buffer: Dict[int, torch.Tensor],
+    ):
+        """Capture the cumulative residual consumed after transformer layer l.
+
+        For non-final layers this is the input of layer (l+1)'s MLP/MOE block.
+        For the final layer this is the input of the model's final norm.
+        """
+        num_layers = len(self.get_layers())
+        if layer_idx < 0 or layer_idx >= num_layers:
+            raise IndexError(f"layer_idx={layer_idx} outside [0, {num_layers})")
+        if layer_idx < num_layers - 1:
+            module = self.get_mlp_module(layer_idx + 1)
+        else:
+            module = self.get_final_norm_module()
+        return module.register_forward_pre_hook(
+            make_module_input_capture_hook(layer_idx, buffer)
+        )
 
     def lora_target_modules(self) -> List[str]:
         return ["q_proj", "k_proj", "v_proj", "o_proj"]
@@ -544,6 +805,54 @@ class JetMoeAdapter(ModelArchitectureAdapter):
         module = self.get_head_activation_module(layer_idx)
         hook_fn = make_attention_output_patch_hook(
             head_idx, fact_layer_tensor, cf_layer_tensor, last_token_indices, num_heads, head_dim
+        )
+        return module.register_forward_hook(hook_fn)
+
+    def register_head_mean_replacement_hook(
+        self,
+        layer_idx: int,
+        head_idx: int,
+        mean_embedding: torch.Tensor,
+        output_pos: Any,
+        num_heads: int,
+        head_dim: int,
+    ):
+        module = self.get_head_activation_module(layer_idx)
+        hook_fn = make_attention_output_mean_replacement_hook(
+            layer_idx,
+            head_idx,
+            mean_embedding,
+            output_pos,
+            num_heads,
+            head_dim,
+        )
+        return module.register_forward_hook(hook_fn)
+
+    def register_head_debias_projection_hook(
+        self,
+        layer_idx: int,
+        head_idx: int,
+        group1_embedding: torch.Tensor,
+        group2_embedding: torch.Tensor,
+        combined_std: Optional[torch.Tensor],
+        output_pos: Any,
+        intervention_strength: float,
+        num_heads: int,
+        head_dim: int,
+        use_std: bool = True,
+    ):
+        module = self.get_head_activation_module(layer_idx)
+        hook_fn = make_attention_output_debias_projection_hook(
+            layer_idx,
+            head_idx,
+            group1_embedding,
+            group2_embedding,
+            combined_std,
+            output_pos,
+            intervention_strength,
+            num_heads,
+            head_dim,
+            use_std=use_std,
         )
         return module.register_forward_hook(hook_fn)
 

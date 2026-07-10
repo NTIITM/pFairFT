@@ -1,5 +1,6 @@
 import argparse
 import csv
+import json
 import os
 from typing import Dict, List, Optional, Tuple
 
@@ -91,6 +92,8 @@ def main():
     parser.add_argument("--pfairft_kl_csv", type=str, required=True)
     parser.add_argument("--global_csv", type=str, required=True)
     parser.add_argument("--pfairft_kl_ce_csv", type=str, default=None)
+    parser.add_argument("--debiased_prompt_csv", type=str, default=None)
+    parser.add_argument("--inference_time_csv", type=str, default=None)
     parser.add_argument("--out_pdf", type=str, required=True)
     parser.add_argument("--model_label", type=str, default="Llama 3B", help="Model label for X-axis")
     args = parser.parse_args()
@@ -102,6 +105,10 @@ def main():
     stats_pkl = _load_intervention_stats(args.pfairft_kl_csv) if os.path.exists(args.pfairft_kl_csv) else None
     stats_g = _load_intervention_stats(args.global_csv) if os.path.exists(args.global_csv) else None
     stats_pklce = _load_intervention_stats(args.pfairft_kl_ce_csv) if args.pfairft_kl_ce_csv and os.path.exists(args.pfairft_kl_ce_csv) else None
+    stats_debiased = _load_intervention_stats(args.debiased_prompt_csv) if args.debiased_prompt_csv and os.path.exists(args.debiased_prompt_csv) else None
+    stats_inference = _load_intervention_stats(args.inference_time_csv) if args.inference_time_csv and os.path.exists(args.inference_time_csv) else None
+    if not stats_b:
+        raise ValueError(f"Baseline CSV produced no valid matched pairs: {args.baseline_csv}")
 
     # We sort by baseline's fairness violation descending
     ordered_qids = sorted(
@@ -113,9 +120,9 @@ def main():
 
     def extract(series_stats):
         if not series_stats:
-            return np.zeros(len(xs)), np.zeros(len(xs))
-        means = [series_stats.get(q, {"mean": 0.0})["mean"] for q in ordered_qids]
-        stds = [series_stats.get(q, {"std": 0.0})["std"] for q in ordered_qids]
+            return np.full(len(xs), np.nan), np.full(len(xs), np.nan)
+        means = [series_stats.get(q, {"mean": np.nan})["mean"] for q in ordered_qids]
+        stds = [series_stats.get(q, {"std": np.nan})["std"] for q in ordered_qids]
         return np.asarray(means, dtype=np.float64), np.asarray(stds, dtype=np.float64)
 
     fig, ax = plt.subplots(figsize=(6, 5))
@@ -139,6 +146,14 @@ def main():
         means_pklce, _ = extract(stats_pklce)
         ax.plot(xs, means_pklce, label="PFairFT-KL-CE", color="black", linewidth=2.0)
 
+    if stats_debiased is not None:
+        means_debiased, _ = extract(stats_debiased)
+        ax.plot(xs, means_debiased, label="Debiased Prompt", color="tab:purple", linewidth=1.5)
+
+    if stats_inference is not None:
+        means_inference, _ = extract(stats_inference)
+        ax.plot(xs, means_inference, label="Inference Time", color="tab:brown", linewidth=1.5)
+
     ax.set_ylabel("Fairness Violation↓", fontweight="bold")
     ax.set_xlabel(f"{args.model_label} Samples", fontweight="bold")
     ax.set_xticks([])
@@ -156,6 +171,22 @@ def main():
     os.makedirs(os.path.dirname(args.out_pdf) or ".", exist_ok=True)
     fig.savefig(args.out_pdf, dpi=200)
     plt.close(fig)
+    metadata = {
+        "model_label": args.model_label,
+        "ordered_qids": ordered_qids,
+        "inputs": {
+            "baseline": args.baseline_csv,
+            "pfairft": args.pfairft_csv,
+            "pfairft_kl": args.pfairft_kl_csv,
+            "global": args.global_csv,
+            "pfairft_kl_ce": args.pfairft_kl_ce_csv,
+            "debiased_prompt": args.debiased_prompt_csv,
+            "inference_time": args.inference_time_csv,
+        },
+        "output_pdf": args.out_pdf,
+    }
+    with open(args.out_pdf + ".metadata.json", "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
     print(f"Plot saved to {args.out_pdf}")
 
 if __name__ == "__main__":

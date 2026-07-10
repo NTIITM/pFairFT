@@ -50,6 +50,8 @@ from probability import (
 from util import extract_race_from_query, create_counterfactual_by_race, get_model_config  # type: ignore
 from sampling import load_samples_by_csv_indices  # type: ignore
 from hook import get_last_token_indices_safe  # type: ignore
+from model_adapter import get_model_adapter
+from residual_probe import collect_next_mlp_inputs
 
 
 class ResumeDataset(Dataset):
@@ -97,97 +99,6 @@ def _kl_pq(p: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
     return torch.sum(p * (torch.log(p) - torch.log(q)), dim=-1)
 
 
-def _collect_mlp_outputs(
-    model: AutoModelForCausalLM,
-    tokenizer: AutoTokenizer,
-    model_type: str,
-    device: torch.device,
-    dataloader: DataLoader,
-    num_layers: int,
-    prompt_key: str,
-) -> Dict[int, np.ndarray]:
-    """Collect last-token *next-layer module inputs* (baseline, no intervention).
-
-    For layer l (0 <= l < num_layers-1): collect the input to layer (l+1).mlp.
-    For the last layer (l == num_layers-1): collect the input to final norm.
-
-    Returns: layer_idx -> [N, hidden_size]
-    """
-
-    layer_to_chunks: Dict[int, List[np.ndarray]] = {l: [] for l in range(num_layers)}
-
-    def make_input_hook():
-        def hook(module, inputs):
-            if not inputs:
-                return
-            x = inputs[0]
-            if not isinstance(x, torch.Tensor):
-                return
-            module._last_input = x
-        return hook
-
-    hpairs = []
-
-    # For l in [0..num_layers-2], hook inputs to next layer's MLP
-    for l in range(num_layers - 1):
-        mlp_next = model.model.layers[l + 1].mlp
-        h = mlp_next.register_forward_pre_hook(make_input_hook())
-        hpairs.append((l, mlp_next, h))
-
-    # For last layer, hook inputs to final norm
-    final_norm = model.model.norm
-    h_norm = final_norm.register_forward_pre_hook(make_input_hook())
-    hpairs.append((num_layers - 1, final_norm, h_norm))
-
-    with torch.no_grad():
-        for batch in tqdm(dataloader, desc=f"Collect next-module inputs ({prompt_key})"):
-            prompts = [format_prompt_for_model(p, model_type) for p in batch[prompt_key]]
-            inputs = tokenizer(
-                prompts,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                add_special_tokens=False,
-            )
-
-            # When using device_map="auto", model params may live on multiple devices.
-            # Move *token tensors* to the device of the embedding matrix to avoid cpu/cuda mismatch.
-            embed_device = model.model.embed_tokens.weight.device
-            for k, v in list(inputs.items()):
-                if isinstance(v, torch.Tensor):
-                    inputs[k] = v.to(embed_device)
-
-            attention_mask = inputs.get("attention_mask", torch.ones_like(inputs["input_ids"]))
-            last_token_indices = get_last_token_indices_safe(inputs["input_ids"], attention_mask, tokenizer)
-            batch_range = torch.arange(inputs["input_ids"].shape[0], device=embed_device)
-
-            _ = model(**inputs)
-
-            for l, mod, _ in hpairs:
-                if not hasattr(mod, "_last_input"):
-                    continue
-                x = mod._last_input
-                if not isinstance(x, torch.Tensor):
-                    continue
-                x_device = x.device
-                last_x = x[
-                    batch_range.to(x_device),
-                    last_token_indices.to(x_device),
-                    :,
-                ]
-                layer_to_chunks[l].append(last_x.detach().cpu().float().numpy())
-                del mod._last_input
-
-    for _, _, h in hpairs:
-        h.remove()
-
-    layer_to_arr: Dict[int, np.ndarray] = {}
-    for l in range(num_layers):
-        if layer_to_chunks[l]:
-            layer_to_arr[l] = np.concatenate(layer_to_chunks[l], axis=0)
-    return layer_to_arr
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", type=str, required=True)
@@ -207,7 +118,7 @@ def main() -> None:
         "--model_type",
         type=str,
         default="auto",
-        choices=["auto", "llama", "qwen", "deepseek"],
+        choices=["auto", "llama", "qwen", "deepseek", "olmoe", "jetmoe"],
     )
     args = parser.parse_args()
 
@@ -237,6 +148,8 @@ def main() -> None:
         args.model_type, model=model, tokenizer=tokenizer, model_path=args.model_path
     )
     print(f"Using model_type: {model_type}")
+    adapter = get_model_adapter(model, model_type=args.model_type, model_path=args.model_path)
+    print(f"Using adapter: {adapter.family} ({adapter.head_activation_kind})")
 
     device = torch.device(args.device)
 
@@ -299,20 +212,20 @@ def main() -> None:
     dataset_obj = ResumeDataset(fact_data, cf_data)
     dataloader = DataLoader(dataset_obj, batch_size=args.batch_size, shuffle=False)
 
-    fact_layer_outs = _collect_mlp_outputs(
+    fact_layer_outs = collect_next_mlp_inputs(
         model=model,
+        adapter=adapter,
         tokenizer=tokenizer,
         model_type=model_type,
-        device=device,
         dataloader=dataloader,
         num_layers=num_layers,
         prompt_key="fact_prompt",
     )
-    cf_layer_outs = _collect_mlp_outputs(
+    cf_layer_outs = collect_next_mlp_inputs(
         model=model,
+        adapter=adapter,
         tokenizer=tokenizer,
         model_type=model_type,
-        device=device,
         dataloader=dataloader,
         num_layers=num_layers,
         prompt_key="cf_prompt",
@@ -320,8 +233,7 @@ def main() -> None:
 
     num_samples = next(iter(fact_layer_outs.values())).shape[0] if fact_layer_outs else 0
 
-    w_u = model.lm_head.weight.to(device=device, dtype=torch.float32)  # [V, Hidden]
-    final_norm = model.model.norm  # final layer norm before lm_head
+    w_u = adapter.get_lm_head_weight().to(device=device, dtype=torch.float32)
 
     mlp_kl = np.zeros((num_layers,), dtype=np.float64)
     mlp_mean_diff = np.zeros((num_layers,), dtype=np.float64)
@@ -353,8 +265,12 @@ def main() -> None:
         fact_hd = torch.from_numpy(fact_layer_outs[l]).to(device=device, dtype=torch.float32)  # [N, Hidden]
         cf_hd = torch.from_numpy(cf_layer_outs[l]).to(device=device, dtype=torch.float32)
 
-        fact_logits = fact_hd @ w_u.t()  # [N, V]
-        cf_logits = cf_hd @ w_u.t()
+        fact_logits = adapter.project_residual_to_logits(
+            fact_hd, apply_final_norm=False
+        ).float()
+        cf_logits = adapter.project_residual_to_logits(
+            cf_hd, apply_final_norm=False
+        ).float()
 
         # Signed cosine similarity between delta input (fact - cf) and sensitive direction (race) in Wu
         # Sensitive direction: mean(Wu[white_tokens]) - mean(Wu[black_tokens])
@@ -428,6 +344,10 @@ def main() -> None:
         "hidden_size": hidden_size,
         "num_samples": num_samples,
         "cand_ids": cand_ids_list,
+        "adapter_family": adapter.family,
+        "head_activation_kind": adapter.head_activation_kind,
+        "probe_surface": "next_mlp_input_cumulative_residual",
+        "probe_norm": "none",
     }
     with open(os.path.join(args.output_dir, "mlp_summary_baseline.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
