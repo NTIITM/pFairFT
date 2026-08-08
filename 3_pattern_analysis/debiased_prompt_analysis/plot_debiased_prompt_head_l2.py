@@ -115,7 +115,7 @@ def main() -> None:
         "--analysis_dir",
         type=str,
         default="",
-        help="Directory containing expr_l2_prompt.npy and expr_l2_debiased.npy.",
+        help="Directory containing expr_l2_prompt.npy and expr_l2_debiased_prompt.npy.",
     )
     p.add_argument(
         "--exp21_model_dir",
@@ -137,7 +137,10 @@ def main() -> None:
         raise ValueError("Provide --analysis_dir (or deprecated --exp21_model_dir).")
 
     expr_prompt = np.load(os.path.join(analysis_dir, "expr_l2_prompt.npy"))
-    expr_deb = np.load(os.path.join(analysis_dir, "expr_l2_debiased.npy"))
+    debiased_path = os.path.join(analysis_dir, "expr_l2_debiased_prompt.npy")
+    if not os.path.exists(debiased_path):
+        debiased_path = os.path.join(analysis_dir, "expr_l2_debiased.npy")
+    expr_deb = np.load(debiased_path)
 
     selected = _load_selected_heads(args.selected_heads_json)
 

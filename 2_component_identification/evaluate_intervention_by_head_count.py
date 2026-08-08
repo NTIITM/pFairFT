@@ -464,6 +464,13 @@ def main():
         default=5,
         help="Step size for head count (default: 5).",
     )
+    parser.add_argument(
+        "--head_counts",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Explicit head-count grid, for example: --head_counts 0 10 20 30 40 48.",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -605,7 +612,10 @@ def main():
 
     results_data = load_intervention_results(embeddings_path)
     all_sensitive_heads = get_sensitive_heads_sorted_by_heatmap(results_data)
-    print(f"Loaded {len(all_sensitive_heads)} sensitive heads (sorted by heatmap KL)")
+    print(
+        f"Loaded {len(all_sensitive_heads)} elbow-selected sensitive heads "
+        "(sorted by heatmap KL)"
+    )
 
     white_embeddings = results_data.get("white_emb", {})
     black_embeddings = results_data.get("black_emb", {})
@@ -702,12 +712,21 @@ def main():
             print(f"  {k}: {v}")
         print("=" * 80)
 
-    # 生成要测试的头数量列表（0, 5, 10, 15, ..., max_head_count）
-    max_n = min(args.max_head_count, len(all_sensitive_heads))
-    head_counts = list(range(0, max_n + 1, args.step))
-    if max_n not in head_counts:
-        head_counts.append(max_n)
-    head_counts = sorted(set(head_counts))
+    if args.head_counts is not None:
+        head_counts = sorted(set(args.head_counts))
+        if not head_counts or head_counts[0] != 0:
+            raise ValueError("--head_counts must include 0 as the baseline.")
+        if head_counts[-1] > len(all_sensitive_heads):
+            raise ValueError(
+                f"Requested {head_counts[-1]} sensitive heads, but the elbow set "
+                f"contains only {len(all_sensitive_heads)}."
+            )
+    else:
+        max_n = min(args.max_head_count, len(all_sensitive_heads))
+        head_counts = list(range(0, max_n + 1, args.step))
+        if max_n not in head_counts:
+            head_counts.append(max_n)
+        head_counts = sorted(set(head_counts))
     print(f"Will test head counts: {head_counts}")
 
     metadata = {
@@ -722,13 +741,15 @@ def main():
         "embeddings_path": embeddings_path,
         "intervention_type": args.intervention_type,
         "head_counts": head_counts,
+        "available_elbow_head_count": len(all_sensitive_heads),
+        "elbow_score": results_data.get("elbow_score"),
         "selected_heads_by_count": {
             str(count): [list(head) for head in all_sensitive_heads[:count]]
             for count in head_counts
         },
         "seed": args.seed,
         "resume_prompt_mode": args.resume_prompt_mode,
-        "head_ranking_scope": "all_heads_sorted_by_importance",
+        "head_ranking_scope": "elbow_heads_sorted_by_importance",
     }
     with open(os.path.join(args.output_dir, "metadata.json"), "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)

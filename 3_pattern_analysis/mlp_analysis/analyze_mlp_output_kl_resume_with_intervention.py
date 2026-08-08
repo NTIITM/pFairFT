@@ -231,9 +231,14 @@ def main() -> None:
         c_logits = adapter.project_residual_to_logits(
             c_hd, apply_final_norm=False
         ).float()
-        f_probs = torch.softmax(f_logits[:, cand_ids].float(), dim=-1)
-        c_probs = torch.softmax(c_logits[:, cand_ids].float(), dim=-1)
-        p_y_f, p_y_c = f_probs[:, yes_mask].sum(-1), c_probs[:, yes_mask].sum(-1)
+        f_probs = torch.softmax(
+            f_logits[:, cand_ids.to(f_logits.device)].float(), dim=-1
+        )
+        c_probs = torch.softmax(
+            c_logits[:, cand_ids.to(c_logits.device)].float(), dim=-1
+        )
+        p_y_f = f_probs[:, yes_mask.to(f_probs.device)].sum(-1)
+        p_y_c = c_probs[:, yes_mask.to(c_probs.device)].sum(-1)
         mlp_mean_diff[l] = torch.abs(p_y_f - p_y_c).mean().item()
         mlp_kl[l] = _kl_pq(torch.stack([p_y_f, 1-p_y_f], -1), torch.stack([p_y_c, 1-p_y_c], -1)).mean().item()
 
@@ -253,6 +258,7 @@ def main() -> None:
         "head_activation_kind": adapter.head_activation_kind,
         "probe_surface": "next_mlp_input_cumulative_residual",
         "probe_norm": "none",
+        "semantic_projection": "W_U h",
     }
     with open(os.path.join(args.output_dir, "mlp_summary_intervened.json"), "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)

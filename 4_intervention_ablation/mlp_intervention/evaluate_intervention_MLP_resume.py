@@ -1,16 +1,14 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""Evaluate p(yes) on Resume dataset UNDER MLP-LEVEL NEGATIVE INTERVENTION (mean ablation).
+"""Evaluate paired Resume fairness under MLP mean ablation.
 
 功能：
 - 使用在 Resume 样本上预先收集的 MLP 均值（white_emb/black_emb），统一 mean ablation：
   mean = (white_mean + black_mean) / 2
-- 对 Resume 数据集上的样本做 yes/no 预测，记录干预下的 p(yes)
-- 输出 per-sample CSV：sample_id(或索引), model, category, race, p_yes, intervention_type
+- 对 Resume top-k 样本构造 fact/counterfactual，并分别记录干预下的 p(yes)
+- 输出与标准 Resume 评估兼容的 paired CSV
 
-注意：
-- 均值文件必须来自 collect_race_mean_MLPs_resume.py
-- 这里不做 paired 分析，只做逐样本记录，方便后续自行聚合或画图。
+均值文件必须来自 collect_race_mean_MLPs_resume.py。
 """
 
 import argparse
@@ -37,15 +35,16 @@ from probability import (  # type: ignore  # noqa: E402
 )
 from prompt import (  # type: ignore  # noqa: E402
     add_yes_no_instruction,
+    build_resume_prompt,
     format_prompt_for_model,
     resolve_model_type,
-    build_category_prompt,
 )
 from util import (  # type: ignore  # noqa: E402
     compute_p_yes_from_logits_with_warning,
     get_input_device,
     get_model_config,
     extract_race_from_query,
+    create_counterfactual_by_race,
 )
 from sampling import (  # type: ignore  # noqa: E402
     load_samples_by_csv_indices,
@@ -264,30 +263,33 @@ def main() -> None:
     if not sensitive_layers:
         raise ValueError("No valid sensitive MLP layers with Resume means.")
 
-    # 5. Prepare prompts
-    prompts: List[str] = []
-    categories: List[str] = []
-    races: List[str] = []
+    # 5. Prepare paired factual/counterfactual prompts.
+    prompt_pairs: List[Dict[str, str]] = []
     for item in fact_data:
-        q = item["query"]
-        race = item.get("race", "")
-        if not race:
-            race = extract_race_from_query(q) or "Unknown"
-        races.append(race)
-        cat = item.get("category", "")
-        categories.append(cat)
-        prompt = (
-            q
-            if args.resume_prompt_mode == "summary_only"
-            else build_category_prompt(q, cat)
+        base_query = build_resume_prompt(
+            summary=item.get("summary", ""),
+            category=item.get("category", ""),
+            mode=args.resume_prompt_mode,
         )
-        prompt = add_yes_no_instruction(prompt)
-        prompts.append(prompt)
+        fact_race = extract_race_from_query(base_query) or item.get("race", "") or "Unknown"
+        paired_fact = {
+            "query": base_query,
+            "summary": item.get("summary", ""),
+            "category": item.get("category", ""),
+            "race": fact_race,
+        }
+        paired_cf = create_counterfactual_by_race(paired_fact)
+        prompt_pairs.append(
+            {
+                "fact": add_yes_no_instruction(paired_fact["query"]),
+                "cf": add_yes_no_instruction(paired_cf["query"]),
+                "fact_race": fact_race,
+                "cf_race": paired_cf.get("race", ""),
+            }
+        )
 
-    # 6. Forward with intervention
-    p_yes_results: List[float] = []
-
-    for idx, (item, prompt) in enumerate(tqdm(list(zip(fact_data, prompts)), desc="Resume MLP negative intervention")):
+    # 6. Forward both sides with the same intervention.
+    def evaluate_prompt(prompt: str, sample_idx: int) -> float:
         formatted_prompt = format_prompt_for_model(prompt, model_type)
         input_ids = tokenizer.encode(
             formatted_prompt,
@@ -324,15 +326,22 @@ def main() -> None:
                     tokenizer=tokenizer,
                     yes_ids=yes_ids,
                     no_ids=no_ids,
-                    sample_idx=idx,
+                    sample_idx=sample_idx,
                     show_warnings=True,
                     prefix="Intervention-MLP-Negative-Resume",
                 )
-                p_yes_results.append(float(p_yes))
+                result = float(p_yes)
         finally:
             remove_intervention_hooks(prompt_hooks)
 
         del input_ids, outputs, logits_row
+        return result
+
+    fact_p_yes_results: List[float] = []
+    cf_p_yes_results: List[float] = []
+    for idx, pair in enumerate(tqdm(prompt_pairs, desc="Resume paired MLP intervention")):
+        fact_p_yes_results.append(evaluate_prompt(pair["fact"], idx))
+        cf_p_yes_results.append(evaluate_prompt(pair["cf"], idx))
 
     # 7. Save CSV
     if args.csv_path:
@@ -343,23 +352,24 @@ def main() -> None:
             writer = csv.writer(f)
             if write_header:
                 writer.writerow([
-                    "sample_id",
-                    "model",
-                    "category",
-                    "race",
-                    "p_yes",
+                    "index",
+                    "fact_p_yes",
+                    "cf_p_yes",
+                    "fact_race",
+                    "cf_race",
                     "intervention_type",
                 ])
-            model_name = os.path.basename(os.path.normpath(args.model_path))
-            for i, (item, p_yes) in enumerate(zip(fact_data, p_yes_results)):
-                if p_yes is None or math.isnan(p_yes):
+            for item, pair, fact_p, cf_p in zip(
+                fact_data, prompt_pairs, fact_p_yes_results, cf_p_yes_results
+            ):
+                if math.isnan(fact_p) or math.isnan(cf_p):
                     continue
                 writer.writerow([
                     int(item["id"]),
-                    model_name,
-                    item.get("category", ""),
-                    races[i],
-                    float(p_yes),
+                    fact_p,
+                    cf_p,
+                    pair["fact_race"],
+                    pair["cf_race"],
                     args.intervention_type,
                 ])
 
@@ -370,6 +380,7 @@ def main() -> None:
         "head_activation_kind": adapter.head_activation_kind,
         "mlp_surface": "routed_moe_block_output",
         "dataset": "resume",
+        "evaluation": "paired_fact_counterfactual",
         "dataset_json_path": args.dataset_json_path,
         "sample_csv_path": args.sample_csv_path or None,
         "sample_size": len(fact_data),
@@ -384,7 +395,7 @@ def main() -> None:
     with open(os.path.join(args.output_dir, "metadata.json"), "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
 
-    print("Done. Total samples:", len(fact_data))
+    print("Done. Total fact/counterfactual pairs:", len(fact_data))
 
 
 if __name__ == "__main__":

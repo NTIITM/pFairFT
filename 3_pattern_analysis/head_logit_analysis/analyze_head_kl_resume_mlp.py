@@ -452,18 +452,26 @@ def main() -> None:
             cf_logits = adapter.project_head_activations_to_logits(
                 l, h, cf_hd, num_heads, head_dim
             )
-            cand_ids = torch.tensor(cand_ids_list, dtype=torch.long, device=fact_logits.device)
-            yes_mask = torch.tensor(
+            fact_cand_ids = torch.tensor(
+                cand_ids_list, dtype=torch.long, device=fact_logits.device
+            )
+            cf_cand_ids = fact_cand_ids.to(cf_logits.device)
+            fact_yes_mask = torch.tensor(
                 [int(tok_id in yes_ids_set) for tok_id in cand_ids_list],
                 dtype=torch.bool,
                 device=fact_logits.device,
             )
+            cf_yes_mask = fact_yes_mask.to(cf_logits.device)
 
-            fact_cand_probs = torch.softmax((fact_logits[:, cand_ids]).float(), dim=-1)
-            cf_cand_probs = torch.softmax((cf_logits[:, cand_ids]).float(), dim=-1)
+            fact_cand_probs = torch.softmax(
+                fact_logits[:, fact_cand_ids].float(), dim=-1
+            )
+            cf_cand_probs = torch.softmax(
+                cf_logits[:, cf_cand_ids].float(), dim=-1
+            )
 
-            p_yes_fact = fact_cand_probs[:, yes_mask].sum(dim=-1)
-            p_yes_cf = cf_cand_probs[:, yes_mask].sum(dim=-1)
+            p_yes_fact = fact_cand_probs[:, fact_yes_mask].sum(dim=-1)
+            p_yes_cf = cf_cand_probs[:, cf_yes_mask].sum(dim=-1)
 
             p_no_fact = 1.0 - p_yes_fact
             p_no_cf = 1.0 - p_yes_cf

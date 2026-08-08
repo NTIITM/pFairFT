@@ -21,13 +21,15 @@ RUN_PROMPT_HEAD="${RUN_PROMPT_HEAD:-1}"
 RUN_INFERENCE_TIME="${RUN_INFERENCE_TIME:-1}"
 RUN_FIGURE8="${RUN_FIGURE8:-1}"
 RUN_A13="${RUN_A13:-1}"
+RUN_RESULT_PLOTS="${RUN_RESULT_PLOTS:-1}"
 
-RANDOM_REPEATS="${RANDOM_REPEATS:-5}"
+RANDOM_REPEATS="${RANDOM_REPEATS:-1}"
 RESUME_SAMPLE_SIZE="${RESUME_SAMPLE_SIZE:-100}"
 HEAD_STEP="${HEAD_STEP:-5}"
-HEAD_MAX="${HEAD_MAX:-100}"
+HEAD_MAX="${HEAD_MAX:-25}"
+HEAD_COUNTS="${HEAD_COUNTS:-}"
 DISCRIM_HEAD_STEP="${DISCRIM_HEAD_STEP:-5}"
-DISCRIM_HEAD_MAX="${DISCRIM_HEAD_MAX:-100}"
+DISCRIM_HEAD_MAX="${DISCRIM_HEAD_MAX:-25}"
 PROMPT_QID="${PROMPT_QID:-33}"
 A13_QID="${A13_QID:-33}"
 
@@ -36,16 +38,16 @@ if [[ -z "$MODEL_NAME" || -z "$MODEL_PATH" || -z "$GPU" ]]; then
 Usage:
   MODEL_NAME=JetMoE-8B-Chat \
   MODEL_PATH=/mnt/nfs/huggingface/jetmoe/jetmoe-8b-chat \
-  MODEL_TYPE=jetmoe GPU=6 DRY_RUN=0 \
+  MODEL_TYPE=jetmoe GPU=6,7 DRY_RUN=0 \
   bash scripts/run_moe_paper_suite.sh
 
-GPU must be the physical GPU index. For this experiment use GPU=6 or GPU=7.
+GPU must contain only the allowed physical GPU indices: 6, 7, 6,7, or 7,6.
 USAGE
   exit 2
 fi
 
-if [[ "$GPU" != "6" && "$GPU" != "7" ]]; then
-  echo "Refusing to run: GPU must be 6 or 7, got $GPU" >&2
+if [[ "$GPU" != "6" && "$GPU" != "7" && "$GPU" != "6,7" && "$GPU" != "7,6" ]]; then
+  echo "Refusing to run: GPU must use only physical GPUs 6 and/or 7, got $GPU" >&2
   exit 2
 fi
 
@@ -69,6 +71,7 @@ SELECTED_HEADS="$HEADS_DIR/selected_heads_elbow.json"
 HEAD_EMBEDDINGS="$HEADS_DIR/results.pkl"
 
 ABLATION_ROOT="$RESULTS_ROOT/intervention_ablation"
+HEAD_RESUME_ROOT="${HEAD_RESUME_ROOT:-$ABLATION_ROOT/head_resume_topk}"
 PATTERN_ROOT="$RESULTS_ROOT/pattern_analysis"
 MLP_ROOT="$RESULTS_ROOT/mlp_analysis"
 INFERENCE_ROOT="$RESULTS_ROOT/inference_time"
@@ -95,26 +98,34 @@ require_file "$RANKING_CSV"
 require_file "$SELECTED_HEADS"
 require_file "$HEAD_EMBEDDINGS"
 
+head_count_args=(--max_head_count "$HEAD_MAX" --step "$HEAD_STEP")
+if [[ -n "$HEAD_COUNTS" ]]; then
+  IFS=',' read -r -a explicit_head_counts <<< "$HEAD_COUNTS"
+  head_count_args=(--head_counts "${explicit_head_counts[@]}")
+fi
+
 if [[ "$RUN_HEAD_RESUME" == "1" ]]; then
-  out="$ABLATION_ROOT/head_resume_topk/sensitive"
+  out="$HEAD_RESUME_ROOT/sensitive"
   run_cmd "$PY" 2_component_identification/evaluate_intervention_by_head_count.py \
     --model_path "$MODEL_PATH" --model_type "$MODEL_TYPE" \
     --dataset_json_path "$DATASET_JSON" --sample_csv_path "$RANKING_CSV" \
     --sample_size "$RESUME_SAMPLE_SIZE" --sensitive_heads_dir "$HEADS_DIR" \
     --resume_prompt_mode summary_only \
+    --batch_size 1 \
     --output_dir "$out" --intervention_type negative \
-    --max_head_count "$HEAD_MAX" --step "$HEAD_STEP"
+    "${head_count_args[@]}"
 
   for ((repeat=0; repeat<RANDOM_REPEATS; repeat++)); do
     seed=$((42 + repeat))
-    out="$ABLATION_ROOT/head_resume_topk/random_seed_${seed}"
+    out="$HEAD_RESUME_ROOT/random_seed_${seed}"
     run_cmd "$PY" 2_component_identification/evaluate_intervention_by_head_count_random.py \
       --model_path "$MODEL_PATH" --model_type "$MODEL_TYPE" \
       --dataset_json_path "$DATASET_JSON" --sample_csv_path "$RANKING_CSV" \
       --sample_size "$RESUME_SAMPLE_SIZE" --sensitive_heads_dir "$HEADS_DIR" \
       --resume_prompt_mode summary_only \
+      --batch_size 1 \
       --output_dir "$out" --seed "$seed" \
-      --max_head_count "$HEAD_MAX" --step "$HEAD_STEP"
+      "${head_count_args[@]}"
   done
 fi
 
@@ -145,6 +156,7 @@ if [[ "$RUN_HEAD_DISCRIM_TOPK" == "1" ]]; then
         --dataset_path "$DISCRIM_JSON" --model_path "$MODEL_PATH" \
         --model_type "$MODEL_TYPE" --sensitive_heads_dir "$HEADS_DIR" \
         --intervention_mode "$mode" --seed "$seed" --output_dir "$out" \
+        --batch_size 1 \
         --results_csv_name results.csv --max_head_count "$DISCRIM_HEAD_MAX" \
         --step "$DISCRIM_HEAD_STEP"
     done
@@ -175,7 +187,7 @@ if [[ "$RUN_HEAD_LOGIT" == "1" ]]; then
   run_cmd "$PY" 3_pattern_analysis/head_logit_analysis/analyze_head_kl_resume.py \
     --model_path "$MODEL_PATH" --model_type "$MODEL_TYPE" \
     --dataset_json_path "$DATASET_JSON" --biased_csv_path "$RANKING_CSV" \
-    --sample_size "$RESUME_SAMPLE_SIZE" --output_dir "$out"
+    --sample_size "$RESUME_SAMPLE_SIZE" --batch_size 1 --output_dir "$out"
 fi
 
 if [[ "$RUN_MLP" == "1" ]]; then
@@ -186,14 +198,15 @@ if [[ "$RUN_MLP" == "1" ]]; then
   run_cmd "$PY" 2_component_identification/analyze_race_sensitive_MLPs.py \
     --model_path "$MODEL_PATH" --model_type "$MODEL_TYPE" \
     --dataset_json_path "$DATASET_JSON" --output_dir "$identify" \
-    --sample_csv_path "$RANKING_CSV" --sample_size "$RESUME_SAMPLE_SIZE"
+    --sample_csv_path "$RANKING_CSV" --sample_size "$RESUME_SAMPLE_SIZE" \
+    --batch_size 1
   run_cmd "$PY" 4_intervention_ablation/mlp_intervention/select_race_sensitive_MLPs.py \
     --results_path "$identify/results_mlp.pkl" --output_dir "$selected"
   run_cmd "$PY" 4_intervention_ablation/mlp_intervention/collect_race_mean_MLPs_resume.py \
     --model_path "$MODEL_PATH" --model_type "$MODEL_TYPE" \
     --dataset_json_path "$DATASET_JSON" --output_path "$means" \
     --sample_csv_path "$RANKING_CSV" --sample_size "$RESUME_SAMPLE_SIZE" \
-    --resume_prompt_mode summary_only
+    --resume_prompt_mode summary_only --batch_size 1
   run_cmd "$PY" 4_intervention_ablation/mlp_intervention/evaluate_intervention_MLP_resume.py \
     --model_path "$MODEL_PATH" --model_type "$MODEL_TYPE" \
     --dataset_json_path "$DATASET_JSON" --sample_csv_path "$RANKING_CSV" \
@@ -209,18 +222,19 @@ if [[ "$RUN_MLP" == "1" ]]; then
   run_cmd "$PY" 3_pattern_analysis/mlp_analysis/analyze_mlp_output_kl_resume.py \
     --model_path "$MODEL_PATH" --model_type "$MODEL_TYPE" \
     --dataset_json_path "$DATASET_JSON" --biased_csv_path "$RANKING_CSV" \
-    --sample_size "$RESUME_SAMPLE_SIZE" --output_dir "$exp20"
+    --sample_size "$RESUME_SAMPLE_SIZE" --batch_size 1 --output_dir "$exp20"
   run_cmd "$PY" 3_pattern_analysis/mlp_analysis/analyze_mlp_output_kl_resume_with_intervention.py \
     --model_path "$MODEL_PATH" --model_type "$MODEL_TYPE" \
     --dataset_json_path "$DATASET_JSON" \
     --biased_csv_path "$RANKING_CSV" --sensitive_heads_path "$SELECTED_HEADS" \
     --embeddings_path "$HEAD_EMBEDDINGS" --sample_size "$RESUME_SAMPLE_SIZE" \
-    --output_dir "$exp20"
+    --batch_size 1 --output_dir "$exp20"
   run_cmd "$PY" 3_pattern_analysis/head_logit_analysis/analyze_head_kl_resume_mlp.py \
     --model_path "$MODEL_PATH" --model_type "$MODEL_TYPE" \
     --dataset_json_path "$DATASET_JSON" --biased_csv_path "$RANKING_CSV" \
     --sample_size "$RESUME_SAMPLE_SIZE" \
     --mlp_selected_path "$selected/selected_mlp_layers_elbow.json" \
+    --batch_size 1 \
     --output_dir "$PATTERN_ROOT/head_logit_with_mlp_intervention"
 fi
 
@@ -229,13 +243,18 @@ if [[ "$RUN_ROUTER" == "1" ]]; then
     --model_path "$MODEL_PATH" --model_type "$MODEL_TYPE" \
     --dataset_json_path "$DATASET_JSON" --sample_csv_path "$RANKING_CSV" \
     --sample_size "$RESUME_SAMPLE_SIZE" --sensitive_heads_path "$SELECTED_HEADS" \
-    --embeddings_path "$HEAD_EMBEDDINGS" --output_dir "$MLP_ROOT/router_top100"
+    --embeddings_path "$HEAD_EMBEDDINGS" --batch_size 1 \
+    --output_dir "$MLP_ROOT/router_top100"
 fi
 
 if [[ "$RUN_PROMPT_HEAD" == "1" ]]; then
+  prompt_out="$PATTERN_ROOT/debiased_prompt_qid${PROMPT_QID}"
   run_cmd "$PY" 3_pattern_analysis/debiased_prompt_analysis/analyze_head_patterns.py \
     --model_path "$MODEL_PATH" --dataset_path "$DISCRIM_JSON" \
-    --qid "$PROMPT_QID" --output_dir "$PATTERN_ROOT/debiased_prompt_qid${PROMPT_QID}"
+    --qid "$PROMPT_QID" --batch_size 1 --output_dir "$prompt_out"
+  run_cmd "$PY" 3_pattern_analysis/debiased_prompt_analysis/plot_debiased_prompt_head_l2.py \
+    --analysis_dir "$prompt_out" --selected_heads_json "$SELECTED_HEADS" \
+    --out_path "$prompt_out/head_prompt_vs_debiased_l2.pdf"
 fi
 
 if [[ "$RUN_INFERENCE_TIME" == "1" ]]; then
@@ -290,11 +309,18 @@ if [[ "$RUN_A13" == "1" ]]; then
   run_cmd "$PY" 3_pattern_analysis/model_comparison/compare_adapter_head_fairness_gap.py \
     --base_model_path "$MODEL_PATH" --first_adapter "$pfairft" --second_adapter "$global" \
     --first_label PFairFT --second_label "Global LoRA CE" --dataset_path "$DISCRIM_JSON" \
-    --qid "$A13_QID" --output_dir "$out"
+    --qid "$A13_QID" --batch_size 1 --output_dir "$out"
   run_cmd "$PY" 3_pattern_analysis/model_comparison/plot_adapter_head_fairness_gap.py \
     --input_dir "$out" --sensitive_heads_json "$SELECTED_HEADS" \
     --output_path "$out/head_pfairft_vs_global_qid${A13_QID}.pdf" \
     --first_label PFairFT --second_label "Global LoRA CE"
+fi
+
+if [[ "$RUN_RESULT_PLOTS" == "1" ]]; then
+  run_cmd "$PY" 3_pattern_analysis/plots/plot_moe_paper_results.py \
+    --model_name "$MODEL_NAME" --results_root "$RESULTS_ROOT" \
+    --selected_heads_json "$SELECTED_HEADS" \
+    --output_dir "$RESULTS_ROOT/paper_plots"
 fi
 
 echo "Paper suite completed for $MODEL_NAME on physical GPU $GPU"

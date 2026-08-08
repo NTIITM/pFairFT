@@ -307,16 +307,22 @@ def main() -> None:
         fact_race_vocab_probs = torch.softmax(fact_logits.float(), dim=-1)  # [N, V]
         cf_race_vocab_probs = torch.softmax(cf_logits.float(), dim=-1)      # [N, V]
         
-        p_race_fact_vec = fact_race_vocab_probs[:, race_ids].sum(dim=-1) # [N]
-        p_race_cf_vec = cf_race_vocab_probs[:, race_ids].sum(dim=-1)     # [N]
+        fact_race_ids = race_ids.to(fact_race_vocab_probs.device)
+        cf_race_ids = race_ids.to(cf_race_vocab_probs.device)
+        p_race_fact_vec = fact_race_vocab_probs[:, fact_race_ids].sum(dim=-1) # [N]
+        p_race_cf_vec = cf_race_vocab_probs[:, cf_race_ids].sum(dim=-1)       # [N]
         
         mlp_input_mean_abs_diff_p_race[l] = float(torch.abs(p_race_fact_vec - p_race_cf_vec).mean().item())
 
-        fact_cand_probs = torch.softmax(fact_logits[:, cand_ids].float(), dim=-1)
-        cf_cand_probs = torch.softmax(cf_logits[:, cand_ids].float(), dim=-1)
+        fact_cand_probs = torch.softmax(
+            fact_logits[:, cand_ids.to(fact_logits.device)].float(), dim=-1
+        )
+        cf_cand_probs = torch.softmax(
+            cf_logits[:, cand_ids.to(cf_logits.device)].float(), dim=-1
+        )
 
-        p_yes_fact = fact_cand_probs[:, yes_mask].sum(dim=-1)
-        p_yes_cf = cf_cand_probs[:, yes_mask].sum(dim=-1)
+        p_yes_fact = fact_cand_probs[:, yes_mask.to(fact_cand_probs.device)].sum(dim=-1)
+        p_yes_cf = cf_cand_probs[:, yes_mask.to(cf_cand_probs.device)].sum(dim=-1)
 
         p_no_fact = 1.0 - p_yes_fact
         p_no_cf = 1.0 - p_yes_cf
@@ -348,6 +354,7 @@ def main() -> None:
         "head_activation_kind": adapter.head_activation_kind,
         "probe_surface": "next_mlp_input_cumulative_residual",
         "probe_norm": "none",
+        "semantic_projection": "W_U h",
     }
     with open(os.path.join(args.output_dir, "mlp_summary_baseline.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)

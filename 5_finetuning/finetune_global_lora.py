@@ -8,12 +8,13 @@
 - 使用 HuggingFace Transformers 加载 Causal LM。
 - 采用 LoRA (PEFT) 进行参数高效微调。
 - 对于每个样本，构建原始简历文本（fact）和翻转种族后的文本（counterfactual）。
-- 使用标准的交叉熵损失（Next Token Prediction）进行训练，不添加额外的 prompt 指令。
+- 使用与 PKFair 一致的 Resume Yes/No prompt 和标准交叉熵损失（Next Token Prediction）。
 """
 
 import argparse
 import csv
 import json
+import math
 import os
 import random
 import subprocess
@@ -39,6 +40,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 from sampling import sample_resume_data_by_race, load_samples_by_csv_indices  # type: ignore
 from util import create_counterfactual_by_race  # type: ignore
 from model_adapter import get_model_adapter  # type: ignore
+from prompt import (  # type: ignore
+    add_yes_no_instruction,
+    build_resume_prompt,
+    format_prompt_for_model,
+    resolve_model_type,
+)
 
 def set_seed(seed: int = 42) -> None:
     """设置随机种子以确保可重复性。"""
@@ -49,6 +56,39 @@ def set_seed(seed: int = 42) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def register_scattermoe_device_hooks(model: nn.Module) -> Tuple[int, int]:
+    """Make JetMoE's ScatterMoE kernels and aux-loss reduction model-parallel safe."""
+    expert_count = 0
+    block_count = 0
+    reduction_device = model.get_input_embeddings().weight.device
+
+    def set_expert_device(_module: nn.Module, inputs: Tuple[object, ...]) -> None:
+        if inputs and torch.is_tensor(inputs[0]) and inputs[0].is_cuda:
+            torch.cuda.set_device(inputs[0].device)
+
+    def gather_aux_loss(
+        _module: nn.Module,
+        _inputs: Tuple[object, ...],
+        output: Tuple[object, ...],
+    ) -> Tuple[object, ...]:
+        if output and torch.is_tensor(output[-1]) and output[-1].device != reduction_device:
+            return output[:-1] + (output[-1].to(reduction_device),)
+        return output
+
+    for module in model.modules():
+        if module.__class__.__name__ == "ParallelExperts":
+            if not getattr(module, "_pfairft_device_hook_registered", False):
+                module.register_forward_pre_hook(set_expert_device)
+                module._pfairft_device_hook_registered = True
+                expert_count += 1
+        elif module.__class__.__name__ == "JetMoEBlock":
+            if not getattr(module, "_pfairft_aux_hook_registered", False):
+                module.register_forward_hook(gather_aux_loss)
+                module._pfairft_aux_hook_registered = True
+                block_count += 1
+    return expert_count, block_count
 
 
 
@@ -182,6 +222,30 @@ def build_lm_features(
     }
 
 
+def compute_chunked_causal_lm_ce(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    token_chunk_size: int = 32,
+) -> torch.Tensor:
+    """Compute full-prompt causal LM CE without upcasting all logits at once."""
+    shift_labels = labels[..., 1:]
+    valid_tokens = (shift_labels != -100).sum().clamp_min(1)
+    loss_sum = torch.zeros((), dtype=torch.float32, device=logits.device)
+
+    for start in range(0, shift_labels.size(1), token_chunk_size):
+        end = min(start + token_chunk_size, shift_labels.size(1))
+        chunk_logits = logits[:, start:end, :].reshape(-1, logits.size(-1)).float()
+        chunk_labels = shift_labels[:, start:end].reshape(-1)
+        loss_sum = loss_sum + F.cross_entropy(
+            chunk_logits,
+            chunk_labels,
+            ignore_index=-100,
+            reduction="sum",
+        )
+
+    return loss_sum / valid_tokens
+
+
 def train_epoch(
     model: nn.Module,
     dataloader: DataLoader,
@@ -193,11 +257,14 @@ def train_epoch(
     gradient_accumulation_steps: int,
     tokenizer: AutoTokenizer,
     max_length: int,
+    model_type: str,
+    resume_prompt_mode: str,
 ) -> Dict[str, float]:
-    """训练一个 epoch：在 factual/counterfactual 纯文本上做 causal LM 继续预训练（交叉熵）。"""
+    """Train one epoch with CE over aligned fact/counterfactual Yes/No prompts."""
     model.train()
     total_loss = 0.0
-    num_batches = 0
+    num_micro_batches = 0
+    num_optimizer_steps = 0
 
     pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{num_epochs}")
 
@@ -208,8 +275,10 @@ def train_epoch(
         raw_cf_texts = batch["cf_text"]
 
         combined_texts: List[str] = []
-        combined_texts.extend(list(raw_fact_texts))
-        combined_texts.extend(list(raw_cf_texts))
+        for text in list(raw_fact_texts) + list(raw_cf_texts):
+            base_prompt = build_resume_prompt(text, mode=resume_prompt_mode)
+            instruction_prompt = add_yes_no_instruction(base_prompt)
+            combined_texts.append(format_prompt_for_model(instruction_prompt, model_type))
 
         features = build_lm_features(
             tokenizer=tokenizer,
@@ -221,13 +290,13 @@ def train_epoch(
         outputs = model(
             input_ids=features["input_ids"],
             attention_mask=features["attention_mask"],
-            labels=features["labels"],
         )
-        loss = outputs.loss
+        loss = compute_chunked_causal_lm_ce(outputs.logits, features["labels"])
         loss = loss / max(1, gradient_accumulation_steps)
         loss.backward()
 
         total_loss += loss.item() * max(1, gradient_accumulation_steps)
+        num_micro_batches += 1
 
         if (step + 1) % gradient_accumulation_steps == 0 or (step + 1) == len(dataloader):
             torch.nn.utils.clip_grad_norm_(
@@ -237,17 +306,21 @@ def train_epoch(
             if scheduler is not None:
                 scheduler.step()
             optimizer.zero_grad()
-            num_batches += 1
+            num_optimizer_steps += 1
 
         pbar.set_postfix(
             {
                 "loss": f"{loss.item() * max(1, gradient_accumulation_steps):.4f}",
-                "avg_loss": f"{total_loss / max(num_batches, 1):.4f}",
+                "avg_loss": f"{total_loss / max(num_micro_batches, 1):.4f}",
             }
         )
 
-    avg_loss = total_loss / max(num_batches, 1)
-    return {"loss": avg_loss}
+    avg_loss = total_loss / max(num_micro_batches, 1)
+    return {
+        "loss": avg_loss,
+        "num_micro_batches": num_micro_batches,
+        "num_optimizer_steps": num_optimizer_steps,
+    }
 
 
 def save_json(data: List[Dict], path: str) -> None:
@@ -329,6 +402,13 @@ def main():
         default=0,
         help="When --sample_csv_path is set, take the first N rows' indices from the CSV. "
         "If <= 0, use all indices in the CSV.",
+    )
+    parser.add_argument(
+        "--resume_prompt_mode",
+        type=str,
+        default="summary_only",
+        choices=["summary_only", "category", "no_job_description"],
+        help="Resume prompt body before the strict Yes/No instruction.",
     )
     parser.add_argument(
         "--train_type",
@@ -467,23 +547,47 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
-    # 对于大模型（如8B），使用 device_map="auto" 自动分布到多GPU
-    device_map = "auto" if use_multi_gpu and torch.cuda.is_available() else None
+    # Load directly onto the visible GPU(s); a later whole-model .to() is very
+    # slow for sparse expert models whose parameters are backed by many shards.
+    device_map = "auto" if torch.cuda.is_available() else None
+    max_memory = None
+    if device_map is not None and args.model_type.lower() == "jetmoe" and num_gpus > 1:
+        # JetMoE's BF16 weights fit on one 24 GiB card, so the default auto
+        # map does not shard it and leaves too little room for long samples.
+        # A 9 GiB placement budget produces a 12/12 whole-block split on two
+        # cards; JetMoEPreTrainedModel already protects JetMoEBlock from splits.
+        max_memory = {i: "9GiB" for i in range(num_gpus)}
 
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
         device_map=device_map,
+        max_memory=max_memory,
         torch_dtype=torch_dtype,
         low_cpu_mem_usage=True, trust_remote_code=True
     )
+
+    if args.model_type.lower() == "jetmoe" and num_gpus > 1:
+        expert_hooks, block_hooks = register_scattermoe_device_hooks(model)
+        print(
+            f"Registered model-parallel hooks for {expert_hooks} ScatterMoE experts "
+            f"and {block_hooks} JetMoE blocks."
+        )
 
     # 如果使用 device_map，模型已经分布在多GPU上，不需要手动 to(device)
     if device_map is None:
         model.to(device)
 
+    model_type = resolve_model_type(
+        requested=args.model_type,
+        model=model,
+        tokenizer=tokenizer,
+        model_path=args.model_path,
+    )
+    print(f"Resolved model_type: {model_type}")
+
     # 根据 train_type 决定是否启用 LoRA
     if args.train_type == "lora":
-        adapter = get_model_adapter(model, model_type=args.model_type, model_path=args.model_path)
+        adapter = get_model_adapter(model, model_type=model_type, model_path=args.model_path)
         target_modules = adapter.lora_target_modules()
         print(f"Using LoRA target modules from model adapter: {target_modules}")
         lora_config = LoraConfig(
@@ -522,14 +626,19 @@ def main():
         print(f"Using device_map='auto'. Input tensors will be on device: {device}")
 
     if args.gradient_checkpointing:
-        model.gradient_checkpointing_enable()
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
         if hasattr(model, "config"):
             model.config.use_cache = False
 
     # 4. 优化器与学习率调度器
-    total_steps = max(
-        1, len(dataloader) * args.num_epochs // max(1, args.gradient_accumulation_steps)
+    steps_per_epoch = math.ceil(
+        len(dataloader) / max(1, args.gradient_accumulation_steps)
     )
+    total_steps = max(1, steps_per_epoch * args.num_epochs)
 
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
@@ -567,6 +676,8 @@ def main():
             gradient_accumulation_steps=args.gradient_accumulation_steps,
             tokenizer=tokenizer,
             max_length=args.max_length,
+            model_type=model_type,
+            resume_prompt_mode=args.resume_prompt_mode,
         )
         training_history.append({"epoch": epoch + 1, **epoch_metrics})
         print(f"  Loss: {epoch_metrics['loss']:.6f}")
@@ -601,7 +712,8 @@ def main():
             "random_sampling": args.random_sampling,
             "bf16": args.bf16,
             "fp16": args.fp16,
-            "model_type": args.model_type,
+            "model_type": model_type,
+            "resume_prompt_mode": args.resume_prompt_mode,
             "lora_target_modules": target_modules if args.train_type == "lora" else [],
         },
     }

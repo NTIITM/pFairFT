@@ -65,6 +65,9 @@ def main() -> None:
     parser.add_argument("--out_png", type=str, default=None)
     parser.add_argument("--model_label", type=str, default="JetMoE")
     parser.add_argument("--pfairft_label", type=str, default="PFairFT")
+    parser.add_argument("--pfairft_kl_label", type=str, default="PFairFT-KL")
+    parser.add_argument("--pfairft_kl_ce_label", type=str, default="PFairFT-KL-CE")
+    parser.add_argument("--global_label", type=str, default="Global")
     args = parser.parse_args()
 
     _set_font()
@@ -72,9 +75,9 @@ def main() -> None:
         (args.pfairft_label, args.pfairft_csv, "tab:orange", 2.0),
     ]
     optional_series = [
-        ("PFairFT-KL", _existing_optional(args.pfairft_kl_csv), "tab:green", 2.0),
-        ("Global", _existing_optional(args.global_csv), "tab:red", 1.5),
-        ("PFairFT-KL-CE", _existing_optional(args.pfairft_kl_ce_csv), "black", 2.0),
+        (args.pfairft_kl_label, _existing_optional(args.pfairft_kl_csv), "tab:green", 2.0),
+        (args.global_label, _existing_optional(args.global_csv), "tab:red", 1.5),
+        (args.pfairft_kl_ce_label, _existing_optional(args.pfairft_kl_ce_csv), "black", 2.0),
     ]
     series.extend(s for s in optional_series if s[1])
 

@@ -38,8 +38,8 @@ def build_mmlu_prompt(question: str, choices: List[str]) -> str:
     )
     return prompt
 
-def get_choice_logit_with_intervention(
-    model, adapter, tokenizer, prompt, choice_letter, device,
+def get_choice_logits_with_intervention(
+    model, adapter, tokenizer, prompt, device,
     intervention_mode, target_heads, white_emb, black_emb, num_heads, head_dim, intervention_strength, model_type
 ) -> float:
     inputs = tokenizer(prompt, return_tensors="pt")
@@ -71,9 +71,11 @@ def get_choice_logit_with_intervention(
         with torch.no_grad():
             outputs = model(**inputs)
             first_step_logits = outputs.logits[:, -1, :]
-            token_ids = tokenizer(choice_letter, add_special_tokens=False).input_ids
-            token_id = token_ids[0]
-            return first_step_logits[0, token_id].item()
+            choice_token_ids = [
+                tokenizer(letter, add_special_tokens=False).input_ids[0]
+                for letter in CHOICE_LETTERS
+            ]
+            return first_step_logits[0, choice_token_ids].float().cpu().tolist()
     finally:
         remove_intervention_hooks(hooks)
 
@@ -124,12 +126,16 @@ def main():
     correct = 0
     for idx, row in enumerate(tqdm(dataset, desc=f"MMLU {args.intervention_mode}")):
         prompt = format_prompt_for_model(build_mmlu_prompt(row["question"], row["choices"]), model_type)
-        logits = [get_choice_logit_with_intervention(model, adapter, tokenizer, prompt, L, device, args.intervention_mode, target_heads, white_emb, black_emb, num_heads, head_dim, args.intervention_strength, model_type) for L in CHOICE_LETTERS]
+        logits = get_choice_logits_with_intervention(
+            model, adapter, tokenizer, prompt, device, args.intervention_mode,
+            target_heads, white_emb, black_emb, num_heads, head_dim,
+            args.intervention_strength, model_type,
+        )
         if np.argmax(logits) == row["answer"]: correct += 1
 
     acc = correct / len(dataset)
     with open(args.output_json, "w") as f:
-        json.dump({"model": args.model_path, "mode": args.intervention_mode, "accuracy": acc, "total": len(dataset), "adapter_family": adapter.family, "head_activation_kind": adapter.head_activation_kind}, f, indent=2)
+        json.dump({"model": args.model_path, "mode": args.intervention_mode, "accuracy": acc, "total": len(dataset), "adapter_family": adapter.family, "head_activation_kind": adapter.head_activation_kind, "choice_scoring": "single_forward_four_choice_logits"}, f, indent=2)
     print(f"Accuracy: {acc:.4f}")
 
 if __name__ == "__main__": main()

@@ -225,6 +225,13 @@ def main():
         help="Step size for head count (default: 5).",
     )
     parser.add_argument(
+        "--head_counts",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Explicit head-count grid, for example: --head_counts 0 10 20 30 40 48.",
+    )
+    parser.add_argument(
         "--results_csv_name",
         type=str,
         default="intervention_results_by_head_count_random.csv",
@@ -396,11 +403,6 @@ def main():
 
     print(f"Model config: layers={num_layers}, heads={num_heads}, head_dim={head_dim}")
 
-    if len(non_sensitive_heads) < args.max_head_count:
-        raise ValueError(
-            f"Not enough non-sensitive heads with embeddings for random intervention: "
-            f"have {len(non_sensitive_heads)}, need at least {args.max_head_count}."
-        )
     print(
         f"Random head sampling: {len(non_sensitive_heads)} non-sensitive heads available "
         f"(intervention: negative / mean ablation only)."
@@ -460,12 +462,21 @@ def main():
             print(f"  {k}: {v}")
         print("=" * 80)
 
-    # 生成要测试的头数量列表（0, 5, 10, 15, ..., 不超过 non_sensitive_heads 数量）
-    max_n = min(args.max_head_count, len(non_sensitive_heads))
-    head_counts = list(range(0, max_n + 1, args.step))
-    if max_n not in head_counts:
-        head_counts.append(max_n)
-    head_counts = sorted(set(head_counts))
+    if args.head_counts is not None:
+        head_counts = sorted(set(args.head_counts))
+        if not head_counts or head_counts[0] != 0:
+            raise ValueError("--head_counts must include 0 as the baseline.")
+        if head_counts[-1] > len(non_sensitive_heads):
+            raise ValueError(
+                f"Requested {head_counts[-1]} random heads, but only "
+                f"{len(non_sensitive_heads)} non-sensitive heads are available."
+            )
+    else:
+        max_n = min(args.max_head_count, len(non_sensitive_heads))
+        head_counts = list(range(0, max_n + 1, args.step))
+        if max_n not in head_counts:
+            head_counts.append(max_n)
+        head_counts = sorted(set(head_counts))
     print(f"Will test head counts (random heads, negative intervention): {head_counts}")
     selected_heads_by_count: Dict[str, List[List[int]]] = {}
 
@@ -632,6 +643,7 @@ def main():
         "sample_size": len(samples),
         "embeddings_path": embeddings_path,
         "head_counts": head_counts,
+        "available_non_sensitive_head_count": len(non_sensitive_heads),
         "selected_heads_by_count": selected_heads_by_count,
         "seed": args.seed,
         "resume_prompt_mode": args.resume_prompt_mode,

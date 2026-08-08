@@ -38,6 +38,7 @@ EXP4: 精准微调 (Precision Fine-tuning) with Fairness Constraints
 import argparse
 import csv
 import json
+import math
 import os
 import pickle
 import random
@@ -123,6 +124,39 @@ def set_seed(seed: int = 42) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def register_scattermoe_device_hooks(model: nn.Module) -> Tuple[int, int]:
+    """Make JetMoE's ScatterMoE kernels and aux-loss reduction model-parallel safe."""
+    expert_count = 0
+    block_count = 0
+    reduction_device = model.get_input_embeddings().weight.device
+
+    def set_expert_device(_module: nn.Module, inputs: Tuple[object, ...]) -> None:
+        if inputs and torch.is_tensor(inputs[0]) and inputs[0].is_cuda:
+            torch.cuda.set_device(inputs[0].device)
+
+    def gather_aux_loss(
+        _module: nn.Module,
+        _inputs: Tuple[object, ...],
+        output: Tuple[object, ...],
+    ) -> Tuple[object, ...]:
+        if output and torch.is_tensor(output[-1]) and output[-1].device != reduction_device:
+            return output[:-1] + (output[-1].to(reduction_device),)
+        return output
+
+    for module in model.modules():
+        if module.__class__.__name__ == "ParallelExperts":
+            if not getattr(module, "_pfairft_device_hook_registered", False):
+                module.register_forward_pre_hook(set_expert_device)
+                module._pfairft_device_hook_registered = True
+                expert_count += 1
+        elif module.__class__.__name__ == "JetMoEBlock":
+            if not getattr(module, "_pfairft_aux_hook_registered", False):
+                module.register_forward_hook(gather_aux_loss)
+                module._pfairft_aux_hook_registered = True
+                block_count += 1
+    return expert_count, block_count
 
 
 def load_fairness_anchors(heads_analysis_dir: str, expected_head_dim: Optional[int] = None) -> Dict:
@@ -365,17 +399,28 @@ def compute_causal_lm_ce_from_logits(
     logits: torch.Tensor,
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
+    token_chunk_size: int = 32,
 ) -> torch.Tensor:
-    """Compute causal LM CE from an existing forward pass."""
-    shift_logits = logits[..., :-1, :].contiguous()
-    shift_labels = input_ids[..., 1:].contiguous()
-    shift_mask = attention_mask[..., 1:].contiguous()
+    """Compute full-prompt causal LM CE in token chunks to limit peak memory."""
+    shift_labels = input_ids[..., 1:]
+    shift_mask = attention_mask[..., 1:]
     shift_labels = shift_labels.masked_fill(shift_mask == 0, -100)
-    return F.cross_entropy(
-        shift_logits.view(-1, shift_logits.size(-1)),
-        shift_labels.view(-1),
-        ignore_index=-100,
-    )
+    valid_tokens = (shift_labels != -100).sum().clamp_min(1)
+    loss_sum = torch.zeros((), dtype=torch.float32, device=logits.device)
+
+    for start in range(0, shift_labels.size(1), token_chunk_size):
+        end = min(start + token_chunk_size, shift_labels.size(1))
+        chunk_logits = logits[:, start:end, :].reshape(-1, logits.size(-1))
+        chunk_labels = shift_labels[:, start:end].reshape(-1)
+        chunk_loss = F.cross_entropy(
+            chunk_logits,
+            chunk_labels,
+            ignore_index=-100,
+            reduction="sum",
+        )
+        loss_sum = loss_sum + chunk_loss.float()
+
+    return loss_sum / valid_tokens
 
 
 # 不再使用全局 _activation_cache，改为使用 batch_activations_buffer（与 exp2_old 一致）
@@ -526,7 +571,8 @@ def train_epoch(
     total_loss = 0.0
     total_kl_loss = 0.0  # KL 仅用于监控，不参与反向更新
     total_fairness_loss = 0.0
-    num_batches = 0
+    num_micro_batches = 0
+    num_optimizer_steps = 0
 
     pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{num_epochs}")
 
@@ -603,6 +649,11 @@ def train_epoch(
             batch_range,
             device,
         )
+        if loss_type.startswith("fairness") and not fairness_loss.requires_grad:
+            raise RuntimeError(
+                "Fairness loss is detached from the training graph; activation-based "
+                "PKFair requires gradient-carrying hook outputs."
+            )
 
         # 清空激活缓存，准备反事实前向（公平性损失只基于事实样本）
         batch_activations_buffer.clear()
@@ -672,6 +723,7 @@ def train_epoch(
         total_loss += loss.item() * max(1, gradient_accumulation_steps)
         total_kl_loss += kl_loss.item()
         total_fairness_loss += fairness_loss.item()
+        num_micro_batches += 1
 
         # 梯度累积
         if (step + 1) % gradient_accumulation_steps == 0 or (
@@ -687,7 +739,7 @@ def train_epoch(
             if scheduler is not None:
                 scheduler.step()
             optimizer.zero_grad()
-            num_batches += 1
+            num_optimizer_steps += 1
 
         pbar.set_postfix(
             {
@@ -695,7 +747,7 @@ def train_epoch(
                 "kl": f"{kl_loss.item():.4f}",
                 "fair": f"{fairness_loss.item():.4f}",
                 "ce": f"{ce_loss.item():.4f}" if ce_loss is not None else "n/a",
-                "avg_loss": f"{total_loss / max(num_batches, 1):.4f}",
+                "avg_loss": f"{total_loss / max(num_micro_batches, 1):.4f}",
             }
         )
 
@@ -713,14 +765,16 @@ def train_epoch(
             fairness_loss,
         )
 
-    avg_loss = total_loss / max(num_batches, 1)
-    avg_kl_loss = total_kl_loss / max(num_batches, 1)
-    avg_fairness_loss = total_fairness_loss / max(num_batches, 1)
+    avg_loss = total_loss / max(num_micro_batches, 1)
+    avg_kl_loss = total_kl_loss / max(num_micro_batches, 1)
+    avg_fairness_loss = total_fairness_loss / max(num_micro_batches, 1)
 
     return {
         "loss": avg_loss,
         "fairness_loss": avg_fairness_loss,
         "kl_loss_monitor": avg_kl_loss,
+        "num_micro_batches": num_micro_batches,
+        "num_optimizer_steps": num_optimizer_steps,
     }
 
 
@@ -1017,14 +1071,29 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
-    device_map = "auto" if use_multi_gpu and torch.cuda.is_available() else None
-    
+    # Load directly onto the visible GPU(s) to avoid a second full parameter
+    # traversal when moving sparse expert models from CPU after loading.
+    device_map = "auto" if torch.cuda.is_available() else None
+    max_memory = None
+    if device_map is not None and args.model_path.lower().find("jetmoe") >= 0 and num_gpus > 1:
+        # Force a real two-card split while keeping every JetMoEBlock intact.
+        # The model class already declares JetMoEBlock in _no_split_modules.
+        max_memory = {i: "9GiB" for i in range(num_gpus)}
+
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
         device_map=device_map,
+        max_memory=max_memory,
         torch_dtype=torch_dtype,
         low_cpu_mem_usage=True, trust_remote_code=True
     )
+
+    if args.model_path.lower().find("jetmoe") >= 0 and num_gpus > 1:
+        expert_hooks, block_hooks = register_scattermoe_device_hooks(model)
+        print(
+            f"Registered model-parallel hooks for {expert_hooks} ScatterMoE experts "
+            f"and {block_hooks} JetMoE blocks."
+        )
     
     if device_map is None:
         model.to(device)
@@ -1121,7 +1190,11 @@ def main():
         print(f"Using device_map='auto'. Input device: {device}")
 
     if args.gradient_checkpointing:
-        model.gradient_checkpointing_enable()
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
         if hasattr(model, "config"):
             model.config.use_cache = False
 
@@ -1151,9 +1224,10 @@ def main():
     print(f"Registered {len(activation_hooks)} activation hooks for {len(selected_layers)} layers")
 
     # 8. 优化器和调度器
-    total_steps = max(
-        1, len(dataloader) * args.num_epochs // max(1, args.gradient_accumulation_steps)
+    steps_per_epoch = math.ceil(
+        len(dataloader) / max(1, args.gradient_accumulation_steps)
     )
+    total_steps = max(1, steps_per_epoch * args.num_epochs)
 
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
@@ -1170,7 +1244,11 @@ def main():
     # 9. 训练循环
     print("=" * 80)
     print("Starting precision fine-tuning with fairness constraints...")
-    print(f"Fairness loss weight (λ): {args.fairness_lambda} (KL is monitor-only)")
+    if args.loss_type in {"fairness", "fairness_ce"}:
+        kl_status = "KL is monitor-only"
+    else:
+        kl_status = "KL is included in the optimized loss"
+    print(f"Fairness loss weight (λ): {args.fairness_lambda} ({kl_status})")
     print("=" * 80)
 
     train_start_time = time.time()
@@ -1235,10 +1313,12 @@ def main():
         "total_train_samples": len(dataset),
         "num_epochs": args.num_epochs,
         "batch_size": args.batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
         "learning_rate": args.learning_rate,
         "fairness_lambda": args.fairness_lambda,
         "loss_type": args.loss_type,
         "num_selected_heads": len(selected_heads),
+        "resume_prompt_mode": args.resume_prompt_mode,
         "training_history": training_history,
         "config": {
             "model_path": args.model_path,

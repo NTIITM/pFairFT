@@ -112,11 +112,13 @@ def run_analysis(model, adapter, tokenizer, dataloader, model_type, output_prefi
 
     kl_p_yes = np.zeros((num_layers, num_heads))
     mean_diff_p_yes = np.zeros((num_layers, num_heads))
+    expr_l2 = np.zeros((num_layers, num_heads))
 
     for l in range(num_layers):
         for h in range(num_heads):
             f_hd = torch.from_numpy(fact_acts[(l, h)])
             c_hd = torch.from_numpy(cf_acts[(l, h)])
+            expr_l2[l, h] = torch.cat([f_hd, c_hd], dim=0).norm(dim=-1).mean().item()
             f_logits = adapter.project_head_activations_to_logits(
                 l, h, f_hd, num_heads, head_dim
             )
@@ -143,6 +145,7 @@ def run_analysis(model, adapter, tokenizer, dataloader, model_type, output_prefi
 
     np.save(f"{output_prefix}_kl.npy", kl_p_yes)
     np.save(f"{output_prefix}_md.npy", mean_diff_p_yes)
+    return expr_l2
 
 def main():
     parser = argparse.ArgumentParser()
@@ -150,6 +153,12 @@ def main():
     parser.add_argument("--dataset_path", type=str, default="/home/common1/hwluo/project/pFairFT/data/discrim-eval/dataset_paired.json")
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--qid", type=int, default=12)
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=1,
+        help="Keep at 1 for formal MOE results so routing is sample-independent.",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -173,8 +182,16 @@ def main():
     for p_type in ["prompt", "debiased_prompt"]:
         print(f"Analyzing {p_type}...")
         ds = DiscrimEvalPairedDataset(target_pairs, p_type)
-        dl = DataLoader(ds, batch_size=8, shuffle=False)
-        run_analysis(model, adapter, tokenizer, dl, model_type, os.path.join(args.output_dir, p_type))
+        dl = DataLoader(ds, batch_size=args.batch_size, shuffle=False)
+        expr_l2 = run_analysis(
+            model,
+            adapter,
+            tokenizer,
+            dl,
+            model_type,
+            os.path.join(args.output_dir, p_type),
+        )
+        np.save(os.path.join(args.output_dir, f"expr_l2_{p_type}.npy"), expr_l2)
 
     metadata = {
         "model_path": args.model_path,
@@ -185,6 +202,8 @@ def main():
         "adapter_family": adapter.family,
         "head_activation_kind": adapter.head_activation_kind,
         "conditions": ["prompt", "debiased_prompt"],
+        "batch_size": args.batch_size,
+        "expr_l2_definition": "mean last-decision-token head L2 over both members of each pair",
     }
     with open(os.path.join(args.output_dir, "metadata.json"), "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)

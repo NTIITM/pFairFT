@@ -476,6 +476,8 @@ def get_sensitive_heads_sorted_by_heatmap(
     white_emb = _normalize_emb_keys(results_data.get("white_emb", {}))
     black_emb = _normalize_emb_keys(results_data.get("black_emb", {}))
     threshold = min_score
+    if threshold is None:
+        threshold = results_data.get("elbow_score")
 
     num_layers, num_heads = heatmap.shape
     candidates = []

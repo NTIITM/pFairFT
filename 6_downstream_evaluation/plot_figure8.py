@@ -14,6 +14,12 @@ def _set_font():
     plt.rcParams["font.size"] = 18
     plt.rcParams["font.weight"] = "bold"
 
+
+def _display_name(model_label: str) -> str:
+    if model_label == "Qwen1.5-MoE-A2.7B-Chat":
+        return "Qwen-MOE"
+    return model_label
+
 def _load_intervention_stats(
     csv_path: str,
 ) -> Dict[int, Dict[str, float]]:
@@ -96,6 +102,10 @@ def main():
     parser.add_argument("--inference_time_csv", type=str, default=None)
     parser.add_argument("--out_pdf", type=str, required=True)
     parser.add_argument("--model_label", type=str, default="Llama 3B", help="Model label for X-axis")
+    parser.add_argument("--pfairft_label", type=str, default="PFairFT")
+    parser.add_argument("--pfairft_kl_label", type=str, default="PFairFT-KL")
+    parser.add_argument("--pfairft_kl_ce_label", type=str, default="PFairFT-KL-CE")
+    parser.add_argument("--global_label", type=str, default="Global")
     args = parser.parse_args()
 
     _set_font()
@@ -132,19 +142,19 @@ def main():
 
     if stats_p is not None:
         means_p, _ = extract(stats_p)
-        ax.plot(xs, means_p, label="PFairFT", color="tab:orange", linewidth=2)
+        ax.plot(xs, means_p, label=args.pfairft_label, color="tab:orange", linewidth=2)
         
     if stats_pkl is not None:
         means_pkl, _ = extract(stats_pkl)
-        ax.plot(xs, means_pkl, label="PFairFT-KL", color="tab:green", linewidth=2)
+        ax.plot(xs, means_pkl, label=args.pfairft_kl_label, color="tab:green", linewidth=2)
         
     if stats_g is not None:
         means_g, _ = extract(stats_g)
-        ax.plot(xs, means_g, label="Global", color="tab:red", linewidth=1.5)
+        ax.plot(xs, means_g, label=args.global_label, color="tab:red", linewidth=1.5)
 
     if stats_pklce is not None:
         means_pklce, _ = extract(stats_pklce)
-        ax.plot(xs, means_pklce, label="PFairFT-KL-CE", color="black", linewidth=2.0)
+        ax.plot(xs, means_pklce, label=args.pfairft_kl_ce_label, color="black", linewidth=2.0)
 
     if stats_debiased is not None:
         means_debiased, _ = extract(stats_debiased)
@@ -155,7 +165,8 @@ def main():
         ax.plot(xs, means_inference, label="Inference Time", color="tab:brown", linewidth=1.5)
 
     ax.set_ylabel("Fairness Violation↓", fontweight="bold")
-    ax.set_xlabel(f"{args.model_label} Samples", fontweight="bold")
+    display_name = _display_name(args.model_label)
+    ax.set_xlabel(f"{display_name} Samples", fontweight="bold")
     ax.set_xticks([])
     ax.set_ylim(-0.02, 0.55)
     ax.set_yticks([0.0, 0.2, 0.4])
@@ -173,6 +184,7 @@ def main():
     plt.close(fig)
     metadata = {
         "model_label": args.model_label,
+        "display_name": display_name,
         "ordered_qids": ordered_qids,
         "inputs": {
             "baseline": args.baseline_csv,

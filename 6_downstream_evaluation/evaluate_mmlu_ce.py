@@ -8,12 +8,16 @@ Calculates the standard Cross-Entropy Loss against the correct answer label.
 import argparse
 import json
 import os
+import sys
 import torch
 import numpy as np
 from datasets import DownloadConfig, load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
 from tqdm import tqdm
+
+sys.path.append(os.path.join(os.path.dirname(__file__), "../src"))
+from prompt import format_prompt_for_model, resolve_model_type
 
 CHOICE_LETTERS = ["A", "B", "C", "D"]
 
@@ -31,6 +35,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--adapter_path", type=str, default="")
+    parser.add_argument(
+        "--model_type",
+        type=str,
+        default="auto",
+        choices=["auto", "llama", "qwen", "deepseek", "olmoe", "jetmoe"],
+    )
     parser.add_argument("--split", type=str, default="validation")
     parser.add_argument("--out_json", type=str, required=True)
     parser.add_argument("--max_samples", type=int, default=0)
@@ -49,6 +59,13 @@ def main():
         model = PeftModel.from_pretrained(model, args.adapter_path, trust_remote_code=True)
     
     model.eval()
+    model_type = resolve_model_type(
+        args.model_type,
+        model=model,
+        tokenizer=tokenizer,
+        model_path=args.model_path,
+    )
+    print(f"Using model_type={model_type}")
 
     download_config = DownloadConfig(local_files_only=os.getenv("HF_DATASETS_OFFLINE") == "1")
     ds = load_dataset(
@@ -68,11 +85,7 @@ def main():
 
     for idx, row in enumerate(tqdm(samples)):
         user_prompt = build_mmlu_prompt(row["question"], row["choices"])
-        full_prompt = (
-            f"<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n"
-            f"{user_prompt}<|eot_id|>"
-            f"<|start_header_id|>assistant<|end_header_id|>\n\nAnswer: "
-        )
+        full_prompt = format_prompt_for_model(user_prompt, model_type)
         
         target_letter = CHOICE_LETTERS[int(row["answer"])]
         full_prompt += target_letter
@@ -89,7 +102,8 @@ def main():
     # Output back to JSON format expected by aggregation scripts
     res = {
         "ce": final_ce,
-        "count": len(samples)
+        "count": len(samples),
+        "model_type": model_type,
     }
     
     os.makedirs(os.path.dirname(args.out_json) or ".", exist_ok=True)

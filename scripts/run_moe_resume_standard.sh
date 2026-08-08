@@ -178,6 +178,7 @@ eval_mmlu() {
   local args=(
     "$PY" 6_downstream_evaluation/evaluate_mmlu_ce.py
     --model_path "$MODEL_PATH"
+    --model_type "$MODEL_TYPE"
     --out_json "$out_json"
     --split "${MMLU_SPLIT:-validation}"
     --max_samples "${MMLU_MAX_SAMPLES:-0}"
