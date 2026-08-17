@@ -26,7 +26,13 @@ from peft import PeftModel
 # Import utilities from parent directory
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src'))
 
-from prompt import add_yes_no_instruction, build_resume_prompt, format_prompt_for_model, resolve_model_type
+from prompt import (
+    add_yes_no_instruction,
+    build_resume_prompt,
+    create_debiased_prompt,
+    format_prompt_for_model,
+    resolve_model_type,
+)
 from probability import (
     YES_CANDIDATES,
     NO_CANDIDATES,
@@ -88,6 +94,12 @@ def main() -> None:
         choices=["summary_only", "category", "no_job_description"],
         help="Resume prompt body before the strict Yes/No instruction.",
     )
+    parser.add_argument(
+        "--prompt_type",
+        choices=["prompt", "debiased_prompt"],
+        default="prompt",
+        help="Optionally append the canonical debiasing instruction.",
+    )
     args = parser.parse_args()
 
     os.makedirs(os.path.dirname(args.output_csv_path) or ".", exist_ok=True)
@@ -133,8 +145,14 @@ def main() -> None:
         }
         cf_item = create_counterfactual_by_race(fact_item)
 
-        fact_query_with_instr = add_yes_no_instruction(fact_item["query"])
-        cf_query_with_instr = add_yes_no_instruction(cf_item["query"])
+        fact_query = fact_item["query"]
+        cf_query = cf_item["query"]
+        if args.prompt_type == "debiased_prompt":
+            fact_query = create_debiased_prompt(fact_query)
+            cf_query = create_debiased_prompt(cf_query)
+
+        fact_query_with_instr = add_yes_no_instruction(fact_query)
+        cf_query_with_instr = add_yes_no_instruction(cf_query)
 
         fact_prompts_raw.append(fact_query_with_instr)
         cf_prompts_raw.append(cf_query_with_instr)
@@ -220,6 +238,23 @@ def main() -> None:
                 fr,
                 cr,
             ])
+
+    metadata = {
+        "dataset": "resume_top100",
+        "dataset_json_path": os.path.abspath(args.dataset_json_path),
+        "biased_csv_path": os.path.abspath(args.biased_csv_path),
+        "base_model_path": os.path.abspath(args.base_model_path),
+        "adapter_path": os.path.abspath(args.adapter_path) if args.adapter_path else None,
+        "mode": args.mode,
+        "model_type": model_type,
+        "resume_prompt_mode": args.resume_prompt_mode,
+        "prompt_type": args.prompt_type,
+        "sample_size": args.sample_size,
+        "num_output_rows": len(indices),
+        "csv_path": os.path.abspath(args.output_csv_path),
+    }
+    with open(args.output_csv_path + ".metadata.json", "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
 
     print(f"Saved results to {args.output_csv_path}")
 

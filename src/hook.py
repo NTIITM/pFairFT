@@ -386,7 +386,7 @@ def make_intervention_hook_debias_projection(
     group1_embedding: torch.Tensor,
     group2_embedding: torch.Tensor,
     combined_std: Optional[torch.Tensor],
-    output_pos: int,
+    output_pos: Optional[int],
     intervention_strength: float,
     num_heads: int,
     head_dim: int,
@@ -404,7 +404,7 @@ def make_intervention_hook_debias_projection(
         group1_embedding: 第一组的嵌入向量（如 male 或 caucasian）
         group2_embedding: 第二组的嵌入向量（如 female 或 african-american）
         combined_std: 组合标准差（可选，用于标准化）
-        output_pos: 要干预的位置
+        output_pos: 要干预的位置；None 表示所有 teacher-forcing 位置
         intervention_strength: 干预强度 α
         num_heads: 注意力头数量
         head_dim: 每个头的维度
@@ -470,7 +470,15 @@ def make_intervention_hook_debias_projection(
         else:
             heads_view = inp.view(bsz, seqlen, num_heads, head_dim)
         
-        if output_pos < seqlen:
+        if output_pos is None:
+            values = heads_view[:, :, head_idx, :]
+            d_device = d.to(dtype=values.dtype, device=inp.device)
+            b_device = b.to(dtype=values.dtype, device=inp.device)
+            projections = torch.sum(values * d_device, dim=-1, keepdim=True)
+            heads_view[:, :, head_idx, :] = (
+                values - intervention_strength * (projections - b_device) * d_device
+            )
+        elif output_pos < seqlen:
             v = heads_view[0, output_pos, head_idx]
             
             # 偏见消除: v' = v - α * (<v, d> - b) * d

@@ -262,6 +262,28 @@ def main() -> None:
                 args.intervention_mode,
             ])
 
+    metadata = {
+        "dataset": "resume_top100",
+        "dataset_json_path": os.path.abspath(args.dataset_json_path),
+        "biased_csv_path": os.path.abspath(args.biased_csv_path),
+        "base_model_path": os.path.abspath(args.base_model_path),
+        "model_type": model_type,
+        "resume_prompt_mode": args.resume_prompt_mode,
+        "prompt_type": "prompt",
+        "sample_size": args.sample_size,
+        "num_output_rows": len(indices),
+        "intervention_mode": args.intervention_mode,
+        "intervention_strength": args.intervention_strength,
+        "seed": args.seed,
+        "selected_head_count": len(target_heads),
+        "sensitive_heads_dir": os.path.abspath(args.sensitive_heads_dir),
+        "adapter_family": adapter.family,
+        "head_activation_kind": adapter.head_activation_kind,
+        "csv_path": os.path.abspath(args.output_csv_path),
+    }
+    with open(args.output_csv_path + ".metadata.json", "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
+
 
 if __name__ == "__main__":
     main()

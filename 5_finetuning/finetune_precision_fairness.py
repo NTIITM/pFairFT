@@ -54,35 +54,107 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 
+HeadMasks = Dict[str, Dict[str, torch.Tensor]]
+
+
+def _matching_layer_masks(
+    param_name: str,
+    head_masks: HeadMasks,
+) -> Optional[Dict[str, torch.Tensor]]:
+    for layer_key, masks in head_masks.items():
+        if layer_key in param_name:
+            return masks
+    return None
+
+
+def _mul_tensor_axis_(
+    tensor: torch.Tensor,
+    mask_1d: torch.Tensor,
+    axis: int,
+    param_name: str,
+) -> None:
+    if tensor.ndim != 2 or tensor.shape[axis] != mask_1d.numel():
+        raise RuntimeError(
+            f"Head-mask dimension mismatch for {param_name}: "
+            f"shape={tuple(tensor.shape)}, axis={axis}, mask={mask_1d.numel()}"
+        )
+    shape = [1, 1]
+    shape[axis] = mask_1d.numel()
+    tensor.mul_(mask_1d.to(device=tensor.device, dtype=tensor.dtype).view(*shape))
+
+
 def _apply_head_grad_mask_(
     model: nn.Module,
-    head_masks: Dict[str, torch.Tensor],
+    head_masks: HeadMasks,
 ) -> None:
-    """将梯度按 head mask 置零，使更新只发生在指定 heads 对应的 hidden slices 上。"""
+    """Mask LoRA gradients on the projection axis that represents attention heads."""
     if not head_masks:
         return
 
     for name, param in model.named_parameters():
-        if (not param.requires_grad) or (param.grad is None):
+        if (
+            (not param.requires_grad)
+            or (param.grad is None)
+            or ("lora_" not in name)
+        ):
             continue
 
-        for layer_key, mask_1d in head_masks.items():
-            if layer_key not in name:
-                continue
+        masks = _matching_layer_masks(name, head_masks)
+        if masks is None:
+            # PEFT injects LoRA into every matching layer. Parameters outside the
+            # selected layers must be skipped entirely, including AdamW decay.
+            param.grad = None
+            continue
 
-            # 仅对 LoRA 参数做 mask（避免误伤其他可训练参数）
-            # 常见命名：...q_proj.lora_A... / ...q_proj.lora_B...
-            if "lora_A" in name:
-                # lora_A: [r, in_features]，对输入维 in_features 做 mask
-                if param.grad.ndim == 2 and param.grad.shape[1] == mask_1d.numel():
-                    param.grad.mul_(mask_1d.to(param.grad.device).unsqueeze(0))
-            elif "lora_B" in name:
-                # lora_B: [out_features, r]，对输出维 out_features 做 mask
-                if param.grad.ndim == 2 and param.grad.shape[0] == mask_1d.numel():
-                    param.grad.mul_(mask_1d.to(param.grad.device).unsqueeze(1))
-            else:
-                # 其他 LoRA/adapter 参数暂不处理
-                pass
+        query_mask = masks["query"]
+        kv_mask = masks["kv"]
+
+        if ".q_proj." in name and "lora_B" in name:
+            _mul_tensor_axis_(param.grad, query_mask, 0, name)
+        elif (".k_proj." in name or ".v_proj." in name) and "lora_B" in name:
+            _mul_tensor_axis_(param.grad, kv_mask, 0, name)
+        elif ".o_proj." in name and "lora_A" in name:
+            _mul_tensor_axis_(param.grad, query_mask, 1, name)
+        elif ".q_proj." not in name and ".k_proj." not in name and ".v_proj." not in name and ".o_proj." not in name:
+            # Preserve the historical behavior for architecture-specific LoRA
+            # projections that do not expose standard q/k/v/o module names.
+            if "lora_A" in name and param.grad.ndim == 2 and param.grad.shape[1] == query_mask.numel():
+                _mul_tensor_axis_(param.grad, query_mask, 1, name)
+            elif "lora_B" in name and param.grad.ndim == 2 and param.grad.shape[0] == query_mask.numel():
+                _mul_tensor_axis_(param.grad, query_mask, 0, name)
+
+
+@torch.no_grad()
+def _enforce_head_param_mask_(
+    model: nn.Module,
+    head_masks: HeadMasks,
+) -> None:
+    """Keep excluded LoRA slices at zero after initialization and optimizer steps."""
+    if not head_masks:
+        return
+
+    for name, param in model.named_parameters():
+        if (not param.requires_grad) or ("lora_" not in name):
+            continue
+
+        masks = _matching_layer_masks(name, head_masks)
+        if masks is None:
+            # Standard LoRA initializes B at zero. Keeping B zero disables the
+            # entire adapter while retaining A's harmless initialization.
+            if "lora_B" in name:
+                param.zero_()
+            continue
+
+        query_mask = masks["query"]
+        kv_mask = masks["kv"]
+        if ".q_proj." in name and "lora_B" in name:
+            _mul_tensor_axis_(param, query_mask, 0, name)
+        elif (".k_proj." in name or ".v_proj." in name) and "lora_B" in name:
+            _mul_tensor_axis_(param, kv_mask, 0, name)
+        elif ".o_proj." in name and "lora_A" in name:
+            # LoRA-A is randomly initialized, so gradient masking alone would
+            # still let learned B use excluded input-head columns.
+            _mul_tensor_axis_(param, query_mask, 1, name)
 
 
 
@@ -511,7 +583,8 @@ def create_head_masks(
     num_heads: int,
     head_dim: int,
     layer_key_fn=None,
-) -> Dict[str, torch.Tensor]:
+    num_key_value_heads: Optional[int] = None,
+) -> HeadMasks:
     """
     为选定的头创建梯度 Mask。
     
@@ -521,24 +594,38 @@ def create_head_masks(
         head_dim: 每个头的维度
         
     Returns:
-        字典，Key 为层标识，Value 为形状为 [num_heads * head_dim] 的 0/1 Mask Tensor
+        字典，Key 为层标识，Value 包含 query 和 KV 投影轴的 0/1 Mask Tensor
     """
+    num_key_value_heads = num_key_value_heads or num_heads
+    if num_heads % num_key_value_heads != 0:
+        raise ValueError(
+            f"num_heads={num_heads} must be divisible by "
+            f"num_key_value_heads={num_key_value_heads}"
+        )
+
     head_masks = {}
     layers_to_heads = {}
     for h in selected_heads:
         layers_to_heads.setdefault(h["layer"], []).append(h["head"])
     
-    full_dim = num_heads * head_dim
+    query_dim = num_heads * head_dim
+    kv_dim = num_key_value_heads * head_dim
+    query_heads_per_kv = num_heads // num_key_value_heads
     
     for layer_idx, head_indices in layers_to_heads.items():
         # 创建 1D mask
-        mask = torch.zeros(full_dim)
+        query_mask = torch.zeros(query_dim)
+        kv_mask = torch.zeros(kv_dim)
         for h_idx in head_indices:
-            mask[h_idx * head_dim : (h_idx + 1) * head_dim] = 1.0
+            if h_idx < 0 or h_idx >= num_heads:
+                raise ValueError(f"Selected head {h_idx} outside [0, {num_heads})")
+            query_mask[h_idx * head_dim : (h_idx + 1) * head_dim] = 1.0
+            kv_idx = h_idx // query_heads_per_kv
+            kv_mask[kv_idx * head_dim : (kv_idx + 1) * head_dim] = 1.0
             
         # 存储该层对应的 mask
         layer_key = layer_key_fn(layer_idx) if layer_key_fn is not None else f"layers.{layer_idx}.self_attn"
-        head_masks[layer_key] = mask
+        head_masks[layer_key] = {"query": query_mask, "kv": kv_mask}
             
     return head_masks
 
@@ -562,7 +649,7 @@ def train_epoch(
     batch_activations_buffer: Dict[int, torch.Tensor],
     num_heads: int,
     head_dim: int,
-    head_masks: Optional[Dict[str, torch.Tensor]] = None,
+    head_masks: Optional[HeadMasks] = None,
     loss_type: str = "kl",
     resume_prompt_mode: str = "category",
 ) -> Dict[str, float]:
@@ -736,6 +823,8 @@ def train_epoch(
                 [p for p in model.parameters() if p.requires_grad], max_norm=1.0
             )
             optimizer.step()
+            if head_masks is not None:
+                _enforce_head_param_mask_(model, head_masks)
             if scheduler is not None:
                 scheduler.step()
             optimizer.zero_grad()
@@ -1113,6 +1202,9 @@ def main():
     config = adapter.get_config()
     num_heads = config["num_heads"]
     head_dim = config["head_dim"]
+    num_key_value_heads = int(
+        getattr(model.config, "num_key_value_heads", num_heads) or num_heads
+    )
     print(f"Initial model config: num_heads={num_heads}, head_dim={head_dim}")
     
     # 检测实际配置（与 exp2_old 一致）
@@ -1171,7 +1263,18 @@ def main():
 
     # 创建 Head Masks 以实现精准微调约束
     print(f"Creating gradient masks for {len(selected_heads)} selected heads...")
-    head_masks = create_head_masks(selected_heads, num_heads, head_dim, adapter.head_mask_layer_key)
+    head_masks = create_head_masks(
+        selected_heads,
+        num_heads,
+        head_dim,
+        num_key_value_heads=num_key_value_heads,
+        layer_key_fn=adapter.head_mask_layer_key,
+    )
+    _enforce_head_param_mask_(model, head_masks)
+    print(
+        f"Head-mask projection config: query_heads={num_heads}, "
+        f"kv_heads={num_key_value_heads}, head_dim={head_dim}"
+    )
 
     if device_map is None:
         model.to(device)

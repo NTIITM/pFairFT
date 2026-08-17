@@ -226,7 +226,13 @@ def make_attention_output_debias_projection_hook(
             actual_head_dim,
         )
         b = bias.to(device=new_hidden.device, dtype=new_hidden.dtype)
-        if torch.is_tensor(output_pos):
+        if output_pos is None:
+            values = heads[:, :, head_idx, :]
+            projections = torch.sum(values * d, dim=-1, keepdim=True)
+            heads[:, :, head_idx, :] = (
+                values - intervention_strength * (projections - b) * d
+            )
+        elif torch.is_tensor(output_pos):
             rows = torch.arange(bsz, device=new_hidden.device)
             positions = output_pos.to(new_hidden.device).clamp(min=0, max=seqlen - 1)
             values = heads[rows, positions, head_idx, :]

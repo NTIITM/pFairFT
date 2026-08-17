@@ -103,7 +103,12 @@ def main():
     res = {
         "ce": final_ce,
         "count": len(samples),
+        "dataset": "cais/mmlu",
+        "split": args.split,
+        "model_path": os.path.abspath(args.model_path),
+        "adapter_path": os.path.abspath(args.adapter_path) if args.adapter_path else None,
         "model_type": model_type,
+        "ce_definition": "mean full-sequence causal-lm loss on formatted prompt plus correct answer letter",
     }
     
     os.makedirs(os.path.dirname(args.out_json) or ".", exist_ok=True)

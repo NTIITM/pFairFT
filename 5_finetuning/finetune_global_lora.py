@@ -259,8 +259,9 @@ def train_epoch(
     max_length: int,
     model_type: str,
     resume_prompt_mode: str,
+    input_prompt_style: str,
 ) -> Dict[str, float]:
-    """Train one epoch with CE over aligned fact/counterfactual Yes/No prompts."""
+    """Train one epoch with CE over fact/counterfactual prompt sequences."""
     model.train()
     total_loss = 0.0
     num_micro_batches = 0
@@ -275,10 +276,14 @@ def train_epoch(
         raw_cf_texts = batch["cf_text"]
 
         combined_texts: List[str] = []
-        for text in list(raw_fact_texts) + list(raw_cf_texts):
-            base_prompt = build_resume_prompt(text, mode=resume_prompt_mode)
-            instruction_prompt = add_yes_no_instruction(base_prompt)
-            combined_texts.append(format_prompt_for_model(instruction_prompt, model_type))
+        if input_prompt_style == "raw_summary":
+            combined_texts.extend(list(raw_fact_texts))
+            combined_texts.extend(list(raw_cf_texts))
+        else:
+            for text in list(raw_fact_texts) + list(raw_cf_texts):
+                base_prompt = build_resume_prompt(text, mode=resume_prompt_mode)
+                instruction_prompt = add_yes_no_instruction(base_prompt)
+                combined_texts.append(format_prompt_for_model(instruction_prompt, model_type))
 
         features = build_lm_features(
             tokenizer=tokenizer,
@@ -411,6 +416,19 @@ def main():
         help="Resume prompt body before the strict Yes/No instruction.",
     )
     parser.add_argument(
+        "--input_prompt_style",
+        type=str,
+        default="yesno_chat",
+        choices=["yesno_chat", "raw_summary"],
+        help="Training input style: current Yes/No chat prompt or legacy raw summary text.",
+    )
+    parser.add_argument(
+        "--lora_target_modules",
+        type=str,
+        default="",
+        help="Optional comma-separated LoRA target modules overriding the model adapter.",
+    )
+    parser.add_argument(
         "--train_type",
         type=str,
         default="lora",
@@ -488,6 +506,12 @@ def main():
         action="store_true",
         default=False,
         help="Enable gradient checkpointing.",
+    )
+    parser.add_argument(
+        "--gradient_checkpointing_reentrant",
+        action="store_true",
+        default=False,
+        help="Use reentrant checkpointing for dynamic MoE routing compatibility.",
     )
     parser.add_argument(
         "--dataloader_num_workers",
@@ -588,7 +612,13 @@ def main():
     # 根据 train_type 决定是否启用 LoRA
     if args.train_type == "lora":
         adapter = get_model_adapter(model, model_type=model_type, model_path=args.model_path)
-        target_modules = adapter.lora_target_modules()
+        target_modules = (
+            [item.strip() for item in args.lora_target_modules.split(",") if item.strip()]
+            if args.lora_target_modules
+            else adapter.lora_target_modules()
+        )
+        if not target_modules:
+            raise ValueError("LoRA target modules cannot be empty.")
         print(f"Using LoRA target modules from model adapter: {target_modules}")
         lora_config = LoraConfig(
             r=args.lora_rank,
@@ -627,7 +657,7 @@ def main():
 
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable(
-            gradient_checkpointing_kwargs={"use_reentrant": False}
+            gradient_checkpointing_kwargs={"use_reentrant": args.gradient_checkpointing_reentrant}
         )
         if hasattr(model, "enable_input_require_grads"):
             model.enable_input_require_grads()
@@ -678,6 +708,7 @@ def main():
             max_length=args.max_length,
             model_type=model_type,
             resume_prompt_mode=args.resume_prompt_mode,
+            input_prompt_style=args.input_prompt_style,
         )
         training_history.append({"epoch": epoch + 1, **epoch_metrics})
         print(f"  Loss: {epoch_metrics['loss']:.6f}")
@@ -714,6 +745,8 @@ def main():
             "fp16": args.fp16,
             "model_type": model_type,
             "resume_prompt_mode": args.resume_prompt_mode,
+            "input_prompt_style": args.input_prompt_style,
+            "lora_target_modules_override": args.lora_target_modules,
             "lora_target_modules": target_modules if args.train_type == "lora" else [],
         },
     }

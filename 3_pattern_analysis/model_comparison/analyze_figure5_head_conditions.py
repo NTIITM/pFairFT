@@ -486,18 +486,20 @@ def main() -> None:
             if suppression_guard
             else "closest_global_balance_fallback"
         )
-        ranked_qids = {int(row["qid"]) for row in ranked}
-        ranked.extend(
-            sorted(
-                (row for row in score_rows if int(row["qid"]) not in ranked_qids),
-                key=lambda row: (
-                    float(row["global_directional_imbalance"]),
-                    -float(row["pfairft_below_both_fraction"]),
-                    -float(row["pfairft_median_suppression"]),
-                    int(row["qid"]),
-                ),
-            )
+    # Keep the preferred subset first, but always emit a rank for every
+    # eligible QID so the audit CSV remains a complete candidate table.
+    ranked_qids = {int(row["qid"]) for row in ranked}
+    ranked.extend(
+        sorted(
+            (row for row in score_rows if int(row["qid"]) not in ranked_qids),
+            key=lambda row: (
+                float(row["global_directional_imbalance"]),
+                -float(row["pfairft_below_both_fraction"]),
+                -float(row["pfairft_median_suppression"]),
+                int(row["qid"]),
+            ),
         )
+    )
     selected_qid = int(ranked[0]["qid"])
     rank_by_qid = {int(row["qid"]): rank + 1 for rank, row in enumerate(ranked)}
     for row in score_rows:
@@ -526,7 +528,8 @@ def main() -> None:
         "selected_heads_json": args.selected_heads_json,
         "num_selected_heads": len(heads),
         "candidate_qids": candidate_qids,
-        "candidate_count": args.candidate_count,
+        "candidate_limit": args.candidate_count,
+        "candidate_count": len(candidate_qids),
         "panel_b_qid": args.panel_b_qid,
         "selected_comparison_qid": selected_qid,
         "selection_mode": selection_mode,
