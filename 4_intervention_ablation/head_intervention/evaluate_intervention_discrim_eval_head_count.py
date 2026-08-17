@@ -325,6 +325,13 @@ def main():
         help="Step size for head count (default: 5).",
     )
     parser.add_argument(
+        "--head_counts",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Explicit head-count grid. Values must be non-negative and no larger than the selected-head pool.",
+    )
+    parser.add_argument(
         "--results_csv_name",
         type=str,
         default="intervention_results_discrim_eval_by_head_count.csv",
@@ -434,7 +441,31 @@ def main():
 
     results_data = load_intervention_results(embeddings_path)
     all_sensitive_heads = get_sensitive_heads_sorted_by_heatmap(results_data)
-    print(f"Loaded {len(all_sensitive_heads)} sensitive heads (sorted by heatmap KL)")
+    selected_path = (
+        os.path.join(args.sensitive_heads_dir, "selected_heads_elbow.json")
+        if args.sensitive_heads_dir
+        else ""
+    )
+    if selected_path and os.path.isfile(selected_path):
+        with open(selected_path, "r", encoding="utf-8") as handle:
+            selected_rows = json.load(handle)
+        selected_set = {
+            (int(row["layer"]), int(row["head"])) for row in selected_rows
+        }
+        all_sensitive_heads = [
+            head for head in all_sensitive_heads if head in selected_set
+        ]
+        if len(all_sensitive_heads) != len(selected_set):
+            missing = sorted(selected_set - set(all_sensitive_heads))
+            raise ValueError(
+                f"Selected heads missing from the heatmap/embedding pool: {missing}"
+            )
+        print(
+            f"Loaded {len(all_sensitive_heads)} elbow-selected sensitive heads "
+            "(sorted by heatmap KL)"
+        )
+    else:
+        print(f"Loaded {len(all_sensitive_heads)} sensitive heads (sorted by heatmap KL)")
 
     white_embeddings = results_data.get("white_emb", {})
     black_embeddings = results_data.get("black_emb", {})
@@ -466,10 +497,21 @@ def main():
     max_n = min(args.max_head_count, len(all_sensitive_heads))
     if args.intervention_mode == "negative_random":
         max_n = min(max_n, len(non_sensitive_heads))
-    head_counts = list(range(0, max_n + 1, args.step))
-    if max_n not in head_counts:
-        head_counts.append(max_n)
-    head_counts = sorted(set(head_counts))
+    if args.head_counts is not None:
+        head_counts = sorted(set(args.head_counts))
+        if any(value < 0 or value > max_n for value in head_counts):
+            raise ValueError(
+                f"--head_counts must be within [0, {max_n}], got {head_counts}"
+            )
+        if 0 not in head_counts or max_n not in head_counts:
+            raise ValueError(
+                f"--head_counts must include both 0 and the full selected pool ({max_n})"
+            )
+    else:
+        head_counts = list(range(0, max_n + 1, args.step))
+        if max_n not in head_counts:
+            head_counts.append(max_n)
+        head_counts = sorted(set(head_counts))
 
     print(f"Will test head counts: {head_counts}")
     selected_heads_by_count: Dict[str, List[List[int]]] = {}

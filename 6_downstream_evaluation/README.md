@@ -19,16 +19,12 @@ Evaluate fine-tuned models on both **fairness benchmarks** (Discrim-Eval, Resume
 
 ## Usage
 
-Use the repository-level standard driver for MOE downstream evaluation:
+Use the repository-level Llama 3 8B Figure workflow:
 
 ```bash
-MODEL_NAME=JetMoE-8B-Chat \
-MODEL_PATH=/mnt/nfs/models/JetMoE-8B-Chat \
-MODEL_TYPE=jetmoe \
-DRY_RUN=0 RUN_ALL=0 RUN_RESUME_EVAL=1 RUN_DISCRIM_EVAL=1 RUN_MMLU=1 RUN_PLOTS=1 \
-bash scripts/run_moe_resume_standard.sh
+bash scripts/run_llama3_8b_figures.sh --stage figure4
+bash scripts/run_llama3_8b_figures.sh --stage figure5
 ```
 
-`evaluate_models_discrim.py` appends to its CSV output, so fresh standard runs should
-remove or rename the target CSV first. The standard driver removes fresh output paths
-before writing them.
+The active evaluators replace output CSVs unless `--append_csv` is explicitly
+provided. The driver isolates every run under its own result root.

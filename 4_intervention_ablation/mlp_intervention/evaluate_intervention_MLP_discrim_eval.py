@@ -447,7 +447,11 @@ def main() -> None:
         "model_type": model_type,
         "adapter_family": adapter.family,
         "head_activation_kind": adapter.head_activation_kind,
-        "mlp_surface": "routed_moe_block_output",
+        "mlp_surface": (
+            "routed_moe_block_output"
+            if adapter.family in {"deepseek", "olmoe", "jetmoe", "qwen_moe"}
+            else "dense_mlp_block_output"
+        ),
         "dataset": "discrim_eval_transfer",
         "dataset_path": args.dataset_path,
         "prompt_type": args.prompt_type,

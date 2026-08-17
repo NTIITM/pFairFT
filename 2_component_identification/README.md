@@ -28,5 +28,6 @@ Use **Mean Ablation** (causal intervention) to identify race-sensitive attention
 
 ## Usage
 ```bash
-bash scripts/exp_heads.sh
+bash scripts/run_llama3_8b_figures.sh --stage figure1
+bash scripts/run_llama3_8b_figures.sh --stage figure2
 ```

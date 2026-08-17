@@ -443,7 +443,7 @@ def main() -> None:
         "mlp_surface": (
             "routed_moe_block_output"
             if adapter.family in {"deepseek", "olmoe", "jetmoe", "qwen_moe"}
-            else "mlp_block_output"
+            else "dense_mlp_block_output"
         ),
         "metric": "mean(abs(p_yes(black) - p_yes(white)))",
         "seed": args.seed,

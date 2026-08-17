@@ -26,12 +26,22 @@ wandb/
 # data/
 results/
 _archive/
+archive/
 data/
 results/
 *.pkl
 *.npy
 *.csv
 
-# Generated paper plots and plotting workspaces
-nmi_plot/
+# Generated paper plots and plotting workspaces. Keep the source files used by
+# the active Llama 3 8B workflow under version control.
+nmi_plot/*
+!nmi_plot/figure5/
+nmi_plot/figure5/*
+!nmi_plot/figure5/make_core_appendix.py
+!nmi_plot/figure5/plot_figure5.py
+!nmi_plot/figure5/prepare_figure5_data.py
+!nmi_plot/llama3_8b/
+nmi_plot/llama3_8b/*
+!nmi_plot/llama3_8b/plot_figures.py
 plot/

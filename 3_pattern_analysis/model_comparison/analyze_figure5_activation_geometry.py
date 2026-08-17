@@ -128,8 +128,8 @@ def load_discrim_records(dataset_path: Path) -> list[dict]:
 def load_heads(heads_dir: Path) -> tuple[list[tuple[int, int]], dict, dict[tuple[int, int], int]]:
     selected = json.loads((heads_dir / "selected_heads_elbow.json").read_text(encoding="utf-8"))
     heads = [(int(row["layer"]), int(row["head"])) for row in selected]
-    if len(heads) != 52 or len(set(heads)) != 52:
-        raise ValueError(f"Expected 52 unique selected heads, found {len(set(heads))}")
+    if not heads or len(heads) != len(set(heads)):
+        raise ValueError(f"Expected a non-empty unique selected-head set, found {len(set(heads))}")
     with (heads_dir / "results.pkl").open("rb") as handle:
         results = pickle.load(handle)
     rank_array = np.asarray(results["rank_array"])

@@ -18,7 +18,6 @@ ACE-based projection intervention — project activations to fairness anchor at 
 
 ## Usage
 ```bash
-bash scripts/run_exp8.sh   # Head intervention evaluation
-bash scripts/run_exp15.sh  # MLP intervention evaluation
-bash scripts/run_exp25.sh  # Full soft intervention + MMLU 
+bash scripts/run_llama3_8b_figures.sh --stage figure2
+bash scripts/run_llama3_8b_figures.sh --stage figure4
 ```

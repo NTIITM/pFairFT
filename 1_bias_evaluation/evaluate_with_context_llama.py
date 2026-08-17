@@ -5,6 +5,7 @@ Evaluate p(yes) with context prompts and compare with existing CSV results.
 计算带context的p(yes)概率，并与CSV中的结果进行比较画图。
 """
 
+import argparse
 import json
 import os
 import sys
@@ -31,24 +32,13 @@ from util import (
     get_input_device,
     load_discrim_eval_target_samples,
     compute_discrim_eval_paired_differences,
-    load_discrim_eval_csv_results,
     get_model_display_name,
 )
 from prompt import resolve_model_type, add_yes_no_instruction
 
 # 仅评估 Llama 8B，对应的 decision_question_ids 为 40 / 12 / 94
-EVAL_JOBS = [
-    {
-        "model_path": "/mnt/nfs/huggingface/LLM-Research/Meta-Llama-3-8B-Instruct/",
-        "model_type": "auto",
-        "target_qids": [40, 12, 94],
-    }
-]
-
-DATASET_PATH = "/home/common1/hwluo/project/pFairFT/data/discrim-eval/dataset_paired.json"
-CSV_PATH = "/home/common1/hwluo/project/pFairFT/exp1/per_sample_details_all_models.csv"
-OUTPUT_DIR_BASE = "/home/common1/hwluo/project/pFairFT/exp1/context_results"
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEFAULT_MODEL_PATH = "/mnt/nfs/huggingface/LLM-Research/Meta-Llama-3-8B-Instruct/"
+DEFAULT_DATASET_PATH = "/home/common1/hwluo/project/pFairFT/data/discrim-eval/dataset_paired.json"
 
 
 def _first_sentence(text: str) -> str:
@@ -205,16 +195,22 @@ def plot_grouped_bar_chart(
     print(f"Plot saved to {output_path}")
 
 
-def run_one_job(job: dict) -> None:
-    model_path = job["model_path"]
-    model_type_arg = job.get("model_type", "auto")
-    target_qids = job["target_qids"]
-
-    os.makedirs(OUTPUT_DIR_BASE, exist_ok=True)
+def run_one_job(args: argparse.Namespace) -> None:
+    model_path = args.model_path
+    model_type_arg = args.model_type
+    device = args.device
+    with open(args.dataset_path, "r", encoding="utf-8") as handle:
+        dataset = json.load(handle)
+    available_qids = sorted({int(row["decision_question_id"]) for row in dataset})
+    target_qids = available_qids if args.all_qids else args.target_qids
+    unknown = sorted(set(target_qids) - set(available_qids))
+    if unknown:
+        raise ValueError(f"Unknown decision-question IDs: {unknown}")
 
     model_name = os.path.basename(os.path.normpath(model_path))
     model_display_name = get_model_display_name(model_name)
-    output_dir = os.path.join(OUTPUT_DIR_BASE, model_name)
+    output_json = os.path.abspath(args.output_path)
+    output_dir = os.path.dirname(output_json) or "."
     os.makedirs(output_dir, exist_ok=True)
 
     print("\n" + "=" * 80)
@@ -225,22 +221,19 @@ def run_one_job(job: dict) -> None:
     print("=" * 80)
 
     # 1. Load data
-    samples, pairs_by_qid = load_discrim_eval_target_samples(DATASET_PATH, target_qids)
+    samples, pairs_by_qid = load_discrim_eval_target_samples(args.dataset_path, target_qids)
     id_to_sample = {s["id"]: s for s in samples}
 
     print(f"\nPairs by question ID:")
     for qid in target_qids:
         print(f"  Q{qid}: {len(pairs_by_qid[qid])} pairs")
 
-    # 2. Load CSV results (Original and Debiased)
-    csv_results = load_discrim_eval_csv_results(CSV_PATH, model_name, target_qids)
-
-    # 3. Load model
+    # 2. Load model
     print(f"\nLoading model from {model_path}...")
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
-        device_map="auto" if DEVICE == "cuda" and torch.cuda.is_available() else None,
-        torch_dtype=torch.float16 if DEVICE == "cuda" and torch.cuda.is_available() else torch.float32,
+        device_map="auto" if device == "cuda" and torch.cuda.is_available() else None,
+        torch_dtype=torch.float16 if device == "cuda" and torch.cuda.is_available() else torch.float32,
         low_cpu_mem_usage=True,
         trust_remote_code=True
     )
@@ -249,7 +242,7 @@ def run_one_job(job: dict) -> None:
         tokenizer.pad_token = tokenizer.eos_token
     model.eval()
 
-    input_device = get_input_device(model, DEVICE)
+    input_device = get_input_device(model, device)
     print(f"Inference device: {input_device}")
 
     model_type = resolve_model_type(model_type_arg, model=model, tokenizer=tokenizer, model_path=model_path)
@@ -262,16 +255,10 @@ def run_one_job(job: dict) -> None:
     print(f"Yes token IDs: {yes_ids}")
     print(f"No token IDs: {no_ids}")
 
-    # 4. Prepare prompts and compute p(yes) for Context+Debiased
-    print("\n=== Computing p(yes) for Context+Debiased prompts ===")
+    # 3. Compute every active Figure 5 context condition from this checkpoint.
+    print("\n=== Computing Original, Debiased, and Context+Debiased p(yes) ===")
 
     results_by_qid = defaultdict(lambda: defaultdict(list))
-
-    # Copy CSV results (Original and Debiased)
-    for qid in target_qids:
-        for condition in ["Original", "Debiased"]:
-            if condition in csv_results[qid]:
-                results_by_qid[qid][condition] = csv_results[qid][condition]
 
     # Build context suffix per qid from exemplars in dataset
     qid_titles: Dict[int, str] = {}
@@ -294,34 +281,35 @@ def run_one_job(job: dict) -> None:
             continue
         context_suffix = qid_context_suffix[qid]
 
-        prompts_context_debiased = [
+        condition_prompts = {
+            "Original": [add_yes_no_instruction(s["prompt"]) for s in qid_samples],
+            "Debiased": [add_yes_no_instruction(s["debiased_prompt"]) for s in qid_samples],
+            "Context+Debiased": [
             add_yes_no_instruction(s["debiased_prompt"] + context_suffix) for s in qid_samples
-        ]
-
-        print("Computing p(yes) for Context+Debiased prompts...")
-        p_yes_context_debiased = compute_p_yes_batch(
-            model=model,
-            tokenizer=tokenizer,
-            prompts=prompts_context_debiased,
-            device=str(input_device),
-            yes_ids=yes_ids,
-            no_ids=no_ids,
-            model_type=model_type,
-            desc=f"Q{qid} Context+Debiased",
-            show_warnings=True,
-        )
-
-        if DEVICE.startswith("cuda"):
+            ],
+        }
+        for condition, prompts in condition_prompts.items():
+            probabilities = compute_p_yes_batch(
+                model=model,
+                tokenizer=tokenizer,
+                prompts=prompts,
+                device=str(input_device),
+                yes_ids=yes_ids,
+                no_ids=no_ids,
+                model_type=model_type,
+                desc=f"Q{qid} {condition}",
+                show_warnings=True,
+            )
+            p_yes_map = {s["id"]: p for s, p in zip(qid_samples, probabilities)}
+            diffs = compute_discrim_eval_paired_differences(
+                pairs_by_qid[qid], id_to_sample, p_yes_map
+            )
+            results_by_qid[qid][condition] = diffs
+            print(f"  {condition}: Mean diff = {np.mean(diffs):.4f}, Std = {np.std(diffs):.4f}")
+        if device.startswith("cuda"):
             torch.cuda.empty_cache()
 
-        p_yes_map = {s["id"]: p for s, p in zip(qid_samples, p_yes_context_debiased)}
-        pairs = pairs_by_qid[qid]
-        diffs = compute_discrim_eval_paired_differences(pairs, id_to_sample, p_yes_map)
-        results_by_qid[qid]["Context+Debiased"] = diffs
-        print(f"  Context+Debiased: Mean diff = {np.mean(diffs):.4f}, Std = {np.std(diffs):.4f}")
-
     # 5. Save results
-    output_json = os.path.join(output_dir, f"context_results_{model_name}.json")
     print(f"\nSaving results to {output_json}...")
 
     summary = {
@@ -342,6 +330,10 @@ def run_one_job(job: dict) -> None:
                 "model_name": model_name,
                 "model_display_name": model_display_name,
                 "model_path": model_path,
+                "dataset_path": os.path.abspath(args.dataset_path),
+                "target_qids": target_qids,
+                "batch_size": args.batch_size,
+                "protocol": "current_model_original_debiased_context_debiased_v1",
                 "summary": summary,
             },
             f,
@@ -350,7 +342,7 @@ def run_one_job(job: dict) -> None:
         )
 
     # 6. Plot (use display name)
-    output_plot = os.path.join(output_dir, f"context_comparison_{model_name}.pdf")
+    output_plot = os.path.splitext(output_json)[0] + ".pdf"
     print("\nGenerating plot...")
     plot_grouped_bar_chart(results_by_qid, output_plot, model_display_name, qid_titles=qid_titles)
 
@@ -358,8 +350,25 @@ def run_one_job(job: dict) -> None:
 
 
 def main():
-    for job in EVAL_JOBS:
-        run_one_job(job)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_path", default=DEFAULT_MODEL_PATH)
+    parser.add_argument(
+        "--model_type",
+        default="llama",
+        choices=["auto", "llama", "qwen", "deepseek", "olmoe", "jetmoe"],
+    )
+    parser.add_argument("--dataset_path", default=DEFAULT_DATASET_PATH)
+    parser.add_argument("--output_path", required=True)
+    parser.add_argument("--target_qids", type=int, nargs="+", default=[40, 12, 94])
+    parser.add_argument("--all_qids", action="store_true")
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument(
+        "--device", default="cuda" if torch.cuda.is_available() else "cpu"
+    )
+    args = parser.parse_args()
+    if args.batch_size != 1:
+        raise ValueError("Formal Figure 5 context evaluation requires batch_size=1")
+    run_one_job(args)
 
 
 if __name__ == "__main__":

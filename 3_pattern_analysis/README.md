@@ -29,7 +29,6 @@ Compare head activation patterns between fine-tuned and baseline models.
 
 ## Usage
 ```bash
-python 3_pattern_analysis/model_comparison/compare_adapter_head_fairness_gap.py --help
-python 3_pattern_analysis/model_comparison/plot_adapter_head_fairness_gap.py --help
-python 3_pattern_analysis/debiased_prompt_analysis/plot_debiased_prompt_head_l2.py --help
+bash scripts/run_llama3_8b_figures.sh --stage figure3
+bash scripts/run_llama3_8b_figures.sh --stage figure5
 ```

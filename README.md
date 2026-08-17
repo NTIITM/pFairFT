@@ -14,50 +14,82 @@ It consists of two major components:
   - `dataset.py`: Contains `CounterfactualDataset` for fact/counterfactual pairings.
   - Core utility scripts: `hook.py`, `probability.py`, `prompt.py`, `sampling.py`, `util.py`.
 - `1_bias_evaluation/` through `6_downstream_evaluation/`: staged experiment code.
-- `scripts/run_moe_resume_standard.sh`: standard MOE resume-ranking workflow driver.
+- `scripts/run_llama3_8b_figures.sh`: the only active experiment driver.
 - `data/`: Resume and Discrim-Eval decision scenario datasets.
 
 ## Usage
 
-For current MOE resume-transfer experiments, use the standard driver instead of old per-experiment shell scripts:
+Run commands from the repository root. The driver uses
+`/home/common1/hwluo/anaconda3/envs/GRPOV/bin/python` by default; select another
+interpreter with `--python`. It validates the local Llama 3 8B checkpoint and
+downloads `LLM-Research/Meta-Llama-3-8B-Instruct` from ModelScope when the
+checkpoint is missing or incomplete.
+
+Inspect the complete workflow without launching GPU experiments:
 
 ```bash
-MODEL_NAME=JetMoE-8B-Chat \
-MODEL_PATH=/mnt/nfs/models/JetMoE-8B-Chat \
-MODEL_TYPE=jetmoe \
-bash scripts/run_moe_resume_standard.sh
+bash scripts/run_llama3_8b_figures.sh --stage figure1-figure5 --dry-run
 ```
 
-The driver defaults to `DRY_RUN=1`. Set `DRY_RUN=0` to execute, and use `RUN_RANKING`,
-`RUN_HEADS`, `RUN_TRAIN`, `RUN_RESUME_EVAL`, `RUN_DISCRIM_EVAL`, `RUN_MMLU`, and
-`RUN_PLOTS` to select phases. The standard comparison branches are baseline, Global
-LoRA CE, PFairFT, PFairFT-KL, and PFairFT-KL-CE. PFairFT means precise selected heads
-with affine fairness and CE; there is no separate PFairFT-CE branch.
-
-After the standard ranking, head selection, and training artifacts exist, run the
-MOE paper analysis suite with an explicit physical GPU (only 6 or 7 are accepted):
+Run all five experiments sequentially:
 
 ```bash
-MODEL_NAME=JetMoE-8B-Chat \
-MODEL_PATH=/mnt/nfs/huggingface/jetmoe/jetmoe-8b-chat \
-MODEL_TYPE=jetmoe GPU=6 DRY_RUN=0 \
-bash scripts/run_moe_paper_suite.sh
+bash scripts/run_llama3_8b_figures.sh --stage figure1-figure5 --gpu 6,7
 ```
 
-The suite keeps Resume `summary_only` ranking/top-100 data for identification and
-in-domain analysis, and uses Discrim-Eval only for transfer evaluation. Sensitive
-head and random non-sensitive-head controls are stored in separate directories;
-random controls default to five seeds (42-46) and are aggregated with error bands.
-For MOE models, an MLP means the full routed FFN/MOE block output. The exp20 probe
-at layer `l` is the input to layer `l+1`'s MLP/MOE block, with the final point taken
-at the input to the final norm. Both baseline and head-intervened probes use `W_U h`
-without applying the final norm. Router-native, fact-router-frozen, and head-induced
-routing changes are emitted as a separate supplemental analysis.
+Alternatively, run one stage at a time. A later stage requires every earlier
+stage to have a valid completion manifest; it never starts missing predecessors
+implicitly.
 
-Use `RUN_HEAD_RESUME`, `RUN_HEAD_DISCRIM_ALL`, `RUN_HEAD_DISCRIM_TOPK`,
-`RUN_ATTENTION`, `RUN_HEAD_LOGIT`, `RUN_MLP`, `RUN_ROUTER`, `RUN_PROMPT_HEAD`,
-`RUN_INFERENCE_TIME`, `RUN_FIGURE8`, and `RUN_A13` to select paper-suite phases.
-The paper suite also defaults to `DRY_RUN=1`.
+```bash
+bash scripts/run_llama3_8b_figures.sh --stage figure1 --gpu 6,7
+bash scripts/run_llama3_8b_figures.sh --stage figure2 --gpu 6,7
+bash scripts/run_llama3_8b_figures.sh --stage figure3 --gpu 6,7
+bash scripts/run_llama3_8b_figures.sh --stage figure4 --gpu 6,7
+bash scripts/run_llama3_8b_figures.sh --stage figure5 --gpu 6,7
+```
+
+The stages are:
+
+1. `figure1`: Resume ranking and Head/MLP component identification.
+2. `figure2`: Resume component intervention and head-count analysis.
+3. `figure3`: MLP residual, logit, and token-attention mechanism analysis.
+4. `figure4`: Discrim-Eval, COMPAS, and Adult intervention analysis.
+5. `figure5`: three-epoch fine-tuning, transfer evaluation, context analysis, and activation geometry.
+
+All new outputs are isolated under
+`results/Meta-Llama-3-8B-Instruct-figures-v1`. Use `--result-root` to select a
+different run. If a stage was interrupted or must be rebuilt, select it and pass
+the same stage to `--force-stage`. This moves that stage and all downstream
+outputs into the run's `stale/` directory before rebuilding:
+
+```bash
+bash scripts/run_llama3_8b_figures.sh \
+  --stage figure3-figure5 \
+  --force-stage figure3 \
+  --gpu 6,7
+```
+
+Useful overrides:
+
+```bash
+bash scripts/run_llama3_8b_figures.sh \
+  --stage figure1-figure5 \
+  --python /path/to/python \
+  --model-dir /path/to/Meta-Llama-3-8B-Instruct \
+  --result-root /path/to/results \
+  --gpu 0,1
+```
+
+The public method binding is intentionally fixed to the Figure 5 convention:
+
+- `PFairFT` = `fairness_kl`
+- `PFairFT-KL` = `fairness_kl_ce`
+- `PFairFT-CE` = `fairness_ce`
+
+Ranking, component identification, and training use Resume `summary_only` data.
+Discrim-Eval is transfer-only. Formal random controls use seed 42, and mechanism
+analyses use batch size 1.
 
 The method is wrapped into OOP classes in `src`. To utilize the main methodologies, simply import the target module:
 

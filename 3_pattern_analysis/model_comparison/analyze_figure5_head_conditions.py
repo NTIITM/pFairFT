@@ -146,8 +146,10 @@ def selected_heads(path: Path) -> list[tuple[int, int]]:
     with path.open("r", encoding="utf-8") as handle:
         rows = json.load(handle)
     heads = [(int(row["layer"]), int(row["head"])) for row in rows]
-    if len(heads) != 52 or len(set(heads)) != 52:
-        raise ValueError(f"Expected 52 unique current sensitive heads, found {len(set(heads))}.")
+    if not heads or len(heads) != len(set(heads)):
+        raise ValueError(
+            f"Expected a non-empty unique current sensitive-head set, found {len(set(heads))}."
+        )
     return heads
 
 

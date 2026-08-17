@@ -21,5 +21,5 @@ Measure and quantify bias in LLMs using the Discrim-Eval benchmark and Resume da
 
 ## Usage
 ```bash
-bash scripts/exp.sh
+bash scripts/run_llama3_8b_figures.sh --stage figure5
 ```

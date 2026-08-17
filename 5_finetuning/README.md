@@ -10,9 +10,9 @@ Implement the **pFairFT** method: targeted LoRA injection on identified discrimi
 2. Inject LoRA adapters **only** on selected sensitive heads
 3. Train selected comparison branches:
    - Global LoRA CE: CE on fact/counterfactual resume pairs across all LoRA target modules.
-   - PFairFT: precise selected heads with affine fairness and CE (`fairness_ce`).
-   - PFairFT-KL: precise selected heads with affine fairness and KL (`fairness_kl`).
-   - PFairFT-KL-CE: precise selected heads with affine fairness, KL, and CE (`fairness_kl_ce`).
+   - PFairFT: precise selected heads with affine fairness and KL (`fairness_kl`).
+   - PFairFT-KL: precise selected heads with affine fairness, KL, and CE (`fairness_kl_ce`).
+   - PFairFT-CE: precise selected heads with affine fairness and CE (`fairness_ce`).
 4. Monitor branch-specific loss metrics and downstream fairness/utility evaluation.
 
 ## Scripts
@@ -28,15 +28,11 @@ Implement the **pFairFT** method: targeted LoRA injection on identified discrimi
 
 ## Usage
 
-Use the repository-level standard driver for MOE resume-transfer runs:
+Use the repository-level Llama 3 8B Figure workflow:
 
 ```bash
-MODEL_NAME=OLMoE-1B-7B-0924-Instruct \
-MODEL_PATH=/mnt/nfs/models/OLMoE-1B-7B-0924-Instruct \
-MODEL_TYPE=olmoe \
-DRY_RUN=0 RUN_TRAIN=1 RUN_RANKING=0 RUN_HEADS=0 RUN_RESUME_EVAL=0 RUN_DISCRIM_EVAL=0 RUN_MMLU=0 RUN_PLOTS=0 \
-bash scripts/run_moe_resume_standard.sh
+bash scripts/run_llama3_8b_figures.sh --stage figure5
 ```
 
-The old `run_exp*` finetuning wrappers were removed because they encoded stale
-sample sizes, prompt modes, or branch names.
+Figure 5 requires validated Figure 1-4 stage manifests and trains every branch
+for three epochs on the full Resume `summary_only` population.
